@@ -1,0 +1,383 @@
+:root {
+  --bg: #0a0a14;
+  --surface: #1a1a2e;
+  --border: #2a2a44;
+  --text: #e0e0e8;
+  --text-dim: #8888a0;
+  --accent: #4f8cff;
+  --accent-hover: #6ea1ff;
+  --danger: #ff4f6a;
+  --success: #3dd68c;
+  --warning: #ffc94f;
+  --radius: 10px;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100dvh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  overflow: hidden;
+}
+
+#root {
+  width: 100%;
+  min-height: 100dvh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+/* ── Лобби ── */
+
+.lobby {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 3rem 2.5rem;
+  text-align: center;
+  max-width: 400px;
+  width: 90%;
+}
+
+.lobby h1 {
+  font-size: 1.8rem;
+  font-weight: 700;
+  margin-bottom: 0.3rem;
+}
+
+.subtitle {
+  color: var(--text-dim);
+  margin-bottom: 2rem;
+  font-size: 0.95rem;
+}
+
+.divider {
+  color: var(--text-dim);
+  margin: 1.4rem 0;
+  font-size: 0.85rem;
+}
+
+.join-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.join-row input {
+  flex: 1;
+  padding: 0.65rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.95rem;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.join-row input:focus {
+  border-color: var(--accent);
+}
+
+/* ── Кнопки ── */
+
+.btn {
+  padding: 0.65rem 1.2rem;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, opacity 0.2s;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  width: 100%;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-secondary {
+  background: var(--border);
+  color: var(--text);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: #3a3a55;
+}
+
+/* ═══════════════════════════════════════════════════════
+   Видеозвонок — полноэкранный layout
+   ═══════════════════════════════════════════════════════ */
+
+.call {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ── Большое видео собеседника ── */
+
+.remote-video {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* object-fit: contain — видео целиком влезает в экран, */
+/* чёрные полосы по бокам для нестандартных пропорций    */
+.remote-video video,
+.remote-video canvas {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* Заглушка пока нет собеседника */
+.remote-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  color: var(--text-dim);
+}
+
+/* ── PiP — своё маленькое видео ── */
+
+.pip-video {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  width: 200px;
+  height: 150px;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 2px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+  z-index: 10;
+  transition: opacity 0.3s;
+}
+
+/* object-fit: cover — заполняет рамку, обрезает лишнее */
+.pip-video video,
+.pip-video canvas {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* ── Ключ сессии (бейдж в углу) ── */
+
+.session-badge {
+  position: absolute;
+  top: 1rem;
+  left: 1rem;
+  font-family: monospace;
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.5);
+  background: rgba(0, 0, 0, 0.4);
+  padding: 0.25rem 0.6rem;
+  border-radius: 6px;
+  z-index: 10;
+  backdrop-filter: blur(4px);
+}
+
+/* ── Статус (оверлей по центру) ── */
+
+.status-overlay {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 1rem;
+  font-weight: 600;
+  padding: 0.6rem 1.4rem;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(8px);
+  z-index: 10;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.status-waiting     { color: var(--text-dim); }
+.status-connecting  { color: var(--warning); }
+.status-connected   { display: none; }
+.status-reconnecting {
+  color: var(--warning);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+.status-disconnected { color: var(--danger); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* ── Панель управления (внизу по центру) ── */
+
+.controls-bar {
+  position: absolute;
+  bottom: 2rem;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.6rem 1rem;
+  background: rgba(20, 20, 35, 0.75);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  z-index: 20;
+}
+
+.ctrl-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text);
+  font-size: 1.2rem;
+  cursor: pointer;
+  transition: background 0.2s, transform 0.15s;
+  user-select: none;
+}
+
+.ctrl-btn:hover {
+  background: rgba(255, 255, 255, 0.18);
+  transform: scale(1.08);
+}
+
+.ctrl-btn:active {
+  transform: scale(0.95);
+}
+
+.ctrl-btn.ctrl-off {
+  background: rgba(255, 79, 106, 0.25);
+  color: var(--danger);
+}
+
+.ctrl-btn.ctrl-hangup {
+  background: var(--danger);
+  color: #fff;
+}
+
+.ctrl-btn.ctrl-hangup:hover {
+  background: #ff6680;
+}
+
+/* ── Слайдер громкости ── */
+
+.volume-control {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0 0.3rem;
+}
+
+.volume-icon {
+  font-size: 1rem;
+  width: 1.3rem;
+  text-align: center;
+}
+
+.volume-control input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 80px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.15);
+  outline: none;
+  cursor: pointer;
+}
+
+.volume-control input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+}
+
+.volume-control input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+}
+
+/* ── Мобилка ── */
+
+@media (max-width: 600px) {
+  .pip-video {
+    width: 120px;
+    height: 90px;
+    top: 0.6rem;
+    right: 0.6rem;
+    border-radius: 8px;
+  }
+
+  .session-badge {
+    top: 0.6rem;
+    left: 0.6rem;
+    font-size: 0.65rem;
+  }
+
+  .controls-bar {
+    bottom: 1rem;
+    gap: 0.4rem;
+    padding: 0.5rem 0.7rem;
+    border-radius: 12px;
+  }
+
+  .ctrl-btn {
+    width: 42px;
+    height: 42px;
+    font-size: 1rem;
+  }
+
+  .volume-control input[type="range"] {
+    width: 60px;
+  }
+}
+
+/* Очень маленькие экраны — PiP ещё компактнее */
+@media (max-width: 400px) {
+  .pip-video {
+    width: 100px;
+    height: 75px;
+  }
+}

@@ -1,0 +1,42 @@
+services:
+  frontend-build:
+    build: ./frontend
+    volumes:
+      - /var/www/video-bridge:/output
+    profiles:
+      - build
+
+  # ── FastAPI сигналинг-сервер ──────────────────────────
+  backend:
+    build: ./backend
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+
+  # ── coturn: STUN + TURN ───────────────────────────────
+  coturn:
+    image: coturn/coturn:latest
+    network_mode: host
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        exec turnserver \
+          -n \
+          --log-file=stdout \
+          --listening-port=3478 \
+          --listening-ip=${SERVER_IP} \
+          --relay-ip=${SERVER_IP} \
+          --external-ip=${SERVER_IP} \
+          --min-port=49152 \
+          --max-port=49252 \
+          --realm=${SERVER_DOMAIN} \
+          --user=${TURN_USERNAME}:${TURN_PASSWORD} \
+          --lt-cred-mech \
+          --fingerprint \
+          --no-tls \
+          --no-dtls \
+          --no-cli
+    env_file: .env
+    restart: unless-stopped
+

@@ -1,0 +1,10 @@
+.env
+.env.example
+.git
+.gitignore
+DEPLOY.md
+nginx/
+coturn/
+node_modules/
+__pycache__/
+*.md
