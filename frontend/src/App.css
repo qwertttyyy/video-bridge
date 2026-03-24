@@ -1,3 +1,5 @@
+/* frontend/src/App.css */
+
 :root {
   --bg: #0a0a14;
   --surface: #1a1a2e;
@@ -59,6 +61,15 @@ body {
   color: var(--text-dim);
   margin-bottom: 2rem;
   font-size: 0.95rem;
+}
+
+.lobby-error {
+  color: var(--danger);
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+  padding: 0.5rem;
+  background: rgba(255, 79, 106, 0.1);
+  border-radius: 6px;
 }
 
 .divider {
@@ -125,7 +136,7 @@ body {
 }
 
 /* ═══════════════════════════════════════════════════════
-   Видеозвонок — полноэкранный layout
+   Видеозвонок
    ═══════════════════════════════════════════════════════ */
 
 .call {
@@ -147,8 +158,6 @@ body {
   justify-content: center;
 }
 
-/* object-fit: contain — видео целиком влезает в экран, */
-/* чёрные полосы по бокам для нестандартных пропорций    */
 .remote-video video,
 .remote-video canvas {
   width: 100%;
@@ -156,32 +165,30 @@ body {
   object-fit: contain;
 }
 
-/* Заглушка пока нет собеседника */
 .remote-placeholder {
-  display: flex;
-  align-items: center;
-  justify-content: center;
   font-size: 1.1rem;
   color: var(--text-dim);
 }
 
-/* ── PiP — своё маленькое видео ── */
+/* ── PiP — адаптивный aspect-ratio ── */
 
 .pip-video {
   position: absolute;
-  top: 1rem;
+  top: 3.2rem;
   right: 1rem;
-  width: 200px;
-  height: 150px;
+  width: 180px;
+  /* height рассчитывается автоматически из aspect-ratio,
+     который устанавливается JS через el.style.aspectRatio */
+  aspect-ratio: 16 / 9; /* дефолт, перезаписывается JS */
+  max-height: 40vh;
   border-radius: 12px;
   overflow: hidden;
   border: 2px solid rgba(255, 255, 255, 0.15);
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
   z-index: 10;
-  transition: opacity 0.3s;
+  transition: aspect-ratio 0.3s;
 }
 
-/* object-fit: cover — заполняет рамку, обрезает лишнее */
 .pip-video video,
 .pip-video canvas {
   width: 100%;
@@ -189,23 +196,47 @@ body {
   object-fit: cover;
 }
 
-/* ── Ключ сессии (бейдж в углу) ── */
+/* ── Верхняя панель (ключ + кнопка ссылки) ── */
+
+.top-bar {
+  position: absolute;
+  top: 0.7rem;
+  left: 0.7rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  z-index: 15;
+}
 
 .session-badge {
-  position: absolute;
-  top: 1rem;
-  left: 1rem;
   font-family: monospace;
   font-size: 0.75rem;
   color: rgba(255, 255, 255, 0.5);
   background: rgba(0, 0, 0, 0.4);
-  padding: 0.25rem 0.6rem;
+  padding: 0.3rem 0.6rem;
   border-radius: 6px;
-  z-index: 10;
   backdrop-filter: blur(4px);
 }
 
-/* ── Статус (оверлей по центру) ── */
+.copy-link-btn {
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.7);
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 0.3rem 0.7rem;
+  border-radius: 6px;
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+  transition: background 0.2s, color 0.2s;
+  white-space: nowrap;
+}
+
+.copy-link-btn:hover {
+  background: rgba(255, 255, 255, 0.15);
+  color: #fff;
+}
+
+/* ── Статус (оверлей) ── */
 
 .status-overlay {
   position: absolute;
@@ -237,7 +268,7 @@ body {
   50% { opacity: 0.5; }
 }
 
-/* ── Панель управления (внизу по центру) ── */
+/* ── Панель управления ── */
 
 .controls-bar {
   position: absolute;
@@ -283,6 +314,11 @@ body {
 .ctrl-btn.ctrl-off {
   background: rgba(255, 79, 106, 0.25);
   color: var(--danger);
+}
+
+.ctrl-btn.ctrl-active {
+  background: rgba(61, 214, 140, 0.25);
+  color: var(--success);
 }
 
 .ctrl-btn.ctrl-hangup {
@@ -339,21 +375,26 @@ body {
   cursor: pointer;
 }
 
-/* ── Мобилка ── */
+/* ── Адаптив ── */
 
 @media (max-width: 600px) {
   .pip-video {
-    width: 120px;
-    height: 90px;
-    top: 0.6rem;
-    right: 0.6rem;
+    width: 110px;
+    top: 3rem;
+    right: 0.5rem;
     border-radius: 8px;
   }
 
-  .session-badge {
-    top: 0.6rem;
-    left: 0.6rem;
+  .top-bar {
+    top: 0.4rem;
+    left: 0.4rem;
+    gap: 0.3rem;
+  }
+
+  .session-badge,
+  .copy-link-btn {
     font-size: 0.65rem;
+    padding: 0.2rem 0.5rem;
   }
 
   .controls-bar {
@@ -370,14 +411,12 @@ body {
   }
 
   .volume-control input[type="range"] {
-    width: 60px;
+    width: 55px;
   }
 }
 
-/* Очень маленькие экраны — PiP ещё компактнее */
 @media (max-width: 400px) {
   .pip-video {
-    width: 100px;
-    height: 75px;
+    width: 90px;
   }
 }

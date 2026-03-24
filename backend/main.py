@@ -1,3 +1,4 @@
+# backend/main.py
 """FastAPI сигналинг-сервер для WebRTC видеомоста."""
 
 import logging
@@ -14,6 +15,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("signaling")
 
+MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "10"))
+
 app = FastAPI(title="Video Bridge Signaling")
 
 app.add_middleware(
@@ -23,7 +26,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-sessions = SessionManager()
+sessions = SessionManager(max_sessions=MAX_SESSIONS)
 
 
 # ── REST ─────────────────────────────────────────────────────────────
@@ -57,7 +60,9 @@ def ice_config():
 def create_session():
     """Создаёт сессию, возвращает ключ."""
     key = sessions.create()
-    logger.info("Сессия создана: %s", key)
+    if key is None:
+        return {"error": "limit", "message": "Достигнут лимит одновременных сессий"}
+    logger.info("Сессия создана: %s  (всего: %d/%d)", key, sessions.count, MAX_SESSIONS)
     return {"sessionKey": key}
 
 
@@ -67,8 +72,9 @@ def create_session():
 async def signaling(ws: WebSocket, session_key: str, client_id: str):
     """Обмен SDP offer/answer и ICE-кандидатами между двумя участниками."""
 
-    if not sessions.exists(session_key):
-        await ws.close(code=4004, reason="Session not found")
+    # ensure — создаёт сессию если нет (для подключения по ссылке)
+    if not sessions.ensure(session_key):
+        await ws.close(code=4002, reason="Session limit reached")
         return
 
     if sessions.is_full_for(session_key, client_id):
@@ -81,7 +87,8 @@ async def signaling(ws: WebSocket, session_key: str, client_id: str):
 
     role = "caller" if count == 1 else "callee"
     action = "reconnect" if is_reconnect else "join"
-    logger.info("[%s] +%s  %s  роль=%s  (участников: %d)", session_key, client_id, action, role, count)
+    logger.info("[%s] +%s  %s  роль=%s  (участников: %d, сессий: %d/%d)",
+                session_key, client_id, action, role, count, sessions.count, MAX_SESSIONS)
 
     await ws.send_json({"type": "role", "role": role})
 
@@ -101,6 +108,7 @@ async def signaling(ws: WebSocket, session_key: str, client_id: str):
     except WebSocketDisconnect:
         logger.info("[%s] -%s  отключился", session_key, client_id)
         sessions.remove_client(session_key, client_id)
+        logger.info("Сессий: %d/%d", sessions.count, MAX_SESSIONS)
 
         peer_ws = sessions.get_peer_ws(session_key, client_id)
         if peer_ws:

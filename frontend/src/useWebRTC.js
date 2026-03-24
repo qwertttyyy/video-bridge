@@ -1,12 +1,11 @@
+// frontend/src/useWebRTC.js
 import { useRef, useState, useCallback, useEffect } from "react";
 
 /**
- * WebRTC-логика: PeerConnection, SDP, trickle ICE, захват камеры.
+ * WebRTC: PeerConnection, SDP, trickle ICE, камера, демонстрация экрана.
  *
- * Реконнект:
- *  - ICE failed/disconnected → ICE restart (пересоздаём offer с iceRestart: true)
- *  - peer_disconnected → закрываем PC, ждём повторного подключения собеседника
- *  - WS реконнект (useSignaling) → получаем новую роль, пересоздаём PC
+ * Реконнект: ICE restart при disconnected/failed.
+ * Демонстрация экрана: replaceTrack() на существующем PeerConnection.
  */
 
 const ICE_RESTART_DELAY = 2000;
@@ -14,6 +13,7 @@ const ICE_RESTART_DELAY = 2000;
 export function useWebRTC({ send, setOnMessage }) {
   const pcRef = useRef(null);
   const localStreamRef = useRef(null);
+  const screenStreamRef = useRef(null);
   const roleRef = useRef(null);
   const iceQueueRef = useRef([]);
   const restartTimerRef = useRef(null);
@@ -22,6 +22,7 @@ export function useWebRTC({ send, setOnMessage }) {
   const [remoteStream, setRemoteStream] = useState(null);
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState(null);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
 
   /* ── Медиа ── */
 
@@ -36,11 +37,7 @@ export function useWebRTC({ send, setOnMessage }) {
           audio: true,
         });
       } catch {
-        console.log("[WebRTC] Не удалось с ideal 720p, пробую video: true");
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: true,
-        });
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       }
       console.log("[WebRTC] getUserMedia OK, треки:",
         stream.getTracks().map(t => `${t.kind}=${t.readyState}, label=${t.label}`));
@@ -53,14 +50,99 @@ export function useWebRTC({ send, setOnMessage }) {
     }
   }, []);
 
-  /* ── ICE Restart (caller инициирует пересогласование) ── */
+  /* ── Демонстрация экрана ── */
+
+  const startScreenShare = useCallback(async () => {
+    const pc = pcRef.current;
+    if (!pc) return;
+
+    try {
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true, // Chrome: системный/вкладочный звук; Firefox/Safari: игнорируется
+      });
+      screenStreamRef.current = screenStream;
+
+      const screenVideoTrack = screenStream.getVideoTracks()[0];
+      const screenAudioTrack = screenStream.getAudioTracks()[0];
+
+      // Заменяем видеотрек в PeerConnection через replaceTrack
+      const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+      if (videoSender) {
+        await videoSender.replaceTrack(screenVideoTrack);
+      }
+
+      // Если есть аудио от экрана — добавляем/заменяем
+      if (screenAudioTrack) {
+        const audioSenders = pc.getSenders().filter(s => s.track?.kind === "audio");
+        if (audioSenders.length > 0) {
+          // Не заменяем микрофон — добавляем второй аудиотрек
+          pc.addTrack(screenAudioTrack, screenStream);
+        }
+      }
+
+      // Обновляем локальный стрим для PiP-отображения
+      const displayStream = new MediaStream([
+        screenVideoTrack,
+        ...(localStreamRef.current?.getAudioTracks() || []),
+      ]);
+      setLocalStream(displayStream);
+      setIsScreenSharing(true);
+
+      // Когда пользователь останавливает шаринг через UI браузера
+      screenVideoTrack.onended = () => {
+        stopScreenShare();
+      };
+
+      console.log("[WebRTC] Демонстрация экрана запущена");
+    } catch (err) {
+      // Пользователь отменил выбор — не ошибка
+      if (err.name !== "NotAllowedError") {
+        console.error("[WebRTC] getDisplayMedia FAIL:", err);
+      }
+    }
+  }, []);
+
+  const stopScreenShare = useCallback(async () => {
+    const pc = pcRef.current;
+    const cameraStream = localStreamRef.current;
+    const screenStream = screenStreamRef.current;
+
+    if (!pc || !cameraStream) return;
+
+    // Останавливаем треки экрана
+    screenStream?.getTracks().forEach(t => t.stop());
+    screenStreamRef.current = null;
+
+    // Возвращаем камеру
+    const cameraVideoTrack = cameraStream.getVideoTracks()[0];
+    if (cameraVideoTrack) {
+      const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
+      if (videoSender) {
+        await videoSender.replaceTrack(cameraVideoTrack);
+      }
+    }
+
+    // Убираем добавленный аудиотрек экрана если был
+    pc.getSenders().forEach(sender => {
+      if (sender.track && !cameraStream.getTracks().includes(sender.track)) {
+        try { pc.removeTrack(sender); } catch { /* ok */ }
+      }
+    });
+
+    setLocalStream(cameraStream);
+    setIsScreenSharing(false);
+    console.log("[WebRTC] Демонстрация экрана остановлена");
+  }, []);
+
+  /* ── ICE Restart ── */
 
   const scheduleIceRestart = useCallback(() => {
     if (restartTimerRef.current) return;
     const pc = pcRef.current;
-    if (!pc || roleRef.current !== "caller") return;
+    if (!pc) return;
 
-    console.log(`[WebRTC] ICE restart запланирован через ${ICE_RESTART_DELAY}мс`);
+    console.log(`[WebRTC] ICE restart через ${ICE_RESTART_DELAY}мс`);
     setStatus("reconnecting");
 
     restartTimerRef.current = setTimeout(async () => {
@@ -69,7 +151,6 @@ export function useWebRTC({ send, setOnMessage }) {
       if (!currentPc || currentPc.signalingState === "closed") return;
 
       try {
-        console.log("[WebRTC] Выполняю ICE restart...");
         const offer = await currentPc.createOffer({ iceRestart: true });
         await currentPc.setLocalDescription(offer);
         send({ type: "offer", sdp: currentPc.localDescription });
@@ -84,6 +165,9 @@ export function useWebRTC({ send, setOnMessage }) {
   const closePc = useCallback(() => {
     clearTimeout(restartTimerRef.current);
     restartTimerRef.current = null;
+    screenStreamRef.current?.getTracks().forEach(t => t.stop());
+    screenStreamRef.current = null;
+    setIsScreenSharing(false);
     pcRef.current?.close();
     pcRef.current = null;
     iceQueueRef.current = [];
@@ -107,9 +191,7 @@ export function useWebRTC({ send, setOnMessage }) {
     };
 
     pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        send({ type: "ice-candidate", candidate: e.candidate });
-      }
+      if (e.candidate) send({ type: "ice-candidate", candidate: e.candidate });
     };
 
     pc.oniceconnectionstatechange = () => {
@@ -121,13 +203,8 @@ export function useWebRTC({ send, setOnMessage }) {
         restartTimerRef.current = null;
         setStatus("connected");
       }
-
-      // ICE restart при сбое (только caller инициирует)
-      if (s === "disconnected") {
+      if (s === "disconnected" || s === "failed") {
         setStatus("reconnecting");
-        scheduleIceRestart();
-      }
-      if (s === "failed") {
         scheduleIceRestart();
       }
     };
@@ -135,7 +212,7 @@ export function useWebRTC({ send, setOnMessage }) {
     return pc;
   }, [send, closePc, scheduleIceRestart]);
 
-  /* ── Сигналинг-обработчики ── */
+  /* ── Сигналинг ── */
 
   const drainIceQueue = useCallback(async (pc) => {
     for (const c of iceQueueRef.current) {
@@ -160,7 +237,6 @@ export function useWebRTC({ send, setOnMessage }) {
       setStatus("connecting");
       const stream = await acquireMedia();
 
-      // Если PC уже существует — это ICE restart, не создаём новый
       let pc = pcRef.current;
       if (!pc || pc.signalingState === "closed") {
         pc = await createPC();
@@ -205,7 +281,7 @@ export function useWebRTC({ send, setOnMessage }) {
     setStatus("idle");
   }, [closePc]);
 
-  /* ── Подписка на входящие WS-сообщения ── */
+  /* ── Подписка WS ── */
 
   useEffect(() => {
     const processMessage = async (data) => {
@@ -217,23 +293,18 @@ export function useWebRTC({ send, setOnMessage }) {
             await acquireMedia();
             setStatus(data.role === "caller" ? "waiting" : "idle");
             break;
-
           case "peer_joined":
             await startCall();
             break;
-
           case "offer":
             await handleOffer(data.sdp);
             break;
-
           case "answer":
             await handleAnswer(data.sdp);
             break;
-
           case "ice-candidate":
             await handleIceCandidate(data.candidate);
             break;
-
           case "peer_disconnected":
             closePc();
             setRemoteStream(null);
@@ -245,11 +316,13 @@ export function useWebRTC({ send, setOnMessage }) {
         setError(err.message);
       }
     };
-
     setOnMessage(processMessage);
   }, [setOnMessage, acquireMedia, startCall, handleOffer, handleAnswer, handleIceCandidate, closePc]);
 
   useEffect(() => cleanup, [cleanup]);
 
-  return { localStream, remoteStream, status, error, cleanup };
+  return {
+    localStream, remoteStream, status, error, cleanup,
+    isScreenSharing, startScreenShare, stopScreenShare,
+  };
 }
