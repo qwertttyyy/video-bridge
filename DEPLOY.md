@@ -63,10 +63,10 @@ nano .env
 
 ```
 SERVER_IP=<реальный публичный IP>
-SERVER_DOMAIN=video.qwertttyyy.ru
+SERVER_DOMAIN=video.example.com
 TURN_USERNAME=myuser
 TURN_PASSWORD=<надёжный_пароль>
-FRONTEND_ORIGIN=https://video.qwertttyyy.ru
+FRONTEND_ORIGIN=https://video.example.com
 ```
 
 ---
@@ -88,16 +88,16 @@ cd ..
 
 ```bash
 # Копируем конфиг
-sudo cp nginx/video.qwertttyyy.ru /etc/nginx/sites-available/video.qwertttyyy.ru
+sudo cp nginx/video.example.com /etc/nginx/sites-available/video.example.com
 
 # Активируем
-sudo ln -sf /etc/nginx/sites-available/video.qwertttyyy.ru /etc/nginx/sites-enabled/
+sudo ln -sf /etc/nginx/sites-available/video.example.com /etc/nginx/sites-enabled/
 
 # Проверяем синтаксис
 sudo nginx -t
 
 # Пока HTTPS-блок сломается (нет сертификата) — временно закомментируйте его:
-sudo nano /etc/nginx/sites-available/video.qwertttyyy.ru
+sudo nano /etc/nginx/sites-available/video.example.com
 # Закомментируйте весь блок server { listen 443 ... }
 
 # Перезапускаем с HTTP-only
@@ -113,14 +113,14 @@ sudo systemctl reload nginx
 sudo mkdir -p /var/www/certbot
 
 # Получаем сертификат
-sudo certbot certonly --webroot -w /var/www/certbot -d video.qwertttyyy.ru
+sudo certbot certonly --webroot -w /var/www/certbot -d video.example.com
 ```
 
 После успешного получения:
 
 ```bash
 # Раскомментируйте HTTPS-блок в конфиге
-sudo nano /etc/nginx/sites-available/video.qwertttyyy.ru
+sudo nano /etc/nginx/sites-available/video.example.com
 
 # Раскомментируйте редирект HTTP → HTTPS (строка return 301)
 
@@ -166,7 +166,7 @@ turnutils_uclient -T -u myuser -w '<пароль>' -p 3478 <SERVER_IP>
 
 ## 10. Тестирование
 
-1. Откройте `https://video.qwertttyyy.ru`
+1. Откройте `https://video.example.com`
 2. **Создать сессию** → скопируйте ключ
 3. Второе устройство → вставьте ключ → **Подключиться**
 4. Разрешите камеру/микрофон
@@ -204,7 +204,7 @@ docker compose logs coturn | head -30  # ошибки?
 
 ### CORS
 
-`FRONTEND_ORIGIN` в `.env` должен совпадать с URL сайта: `https://video.qwertttyyy.ru` (без `/` в конце).
+`FRONTEND_ORIGIN` в `.env` должен совпадать с URL сайта: `https://video.example.com` (без `/` в конце).
 
 ---
 

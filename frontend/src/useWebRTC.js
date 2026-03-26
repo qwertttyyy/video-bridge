@@ -2,10 +2,10 @@
 import { useRef, useState, useCallback, useEffect } from "react";
 
 /**
- * WebRTC: PeerConnection, SDP, trickle ICE, камера, демонстрация экрана.
+ * WebRTC: PeerConnection, SDP, trickle ICE, камера, демонстрация экрана, чат.
  *
- * Реконнект: ICE restart при disconnected/failed.
- * Демонстрация экрана: replaceTrack() на существующем PeerConnection.
+ * Демонстрация экрана: removeTrack + addTrack + ренегоциация (НЕ replaceTrack).
+ * Это надёжнее replaceTrack т.к. вызывает ontrack на ресивере с новым треком.
  */
 
 const ICE_RESTART_DELAY = 2000;
@@ -14,41 +14,73 @@ export function useWebRTC({ send, setOnMessage }) {
   const pcRef = useRef(null);
   const localStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
+  const remoteRef = useRef(null);
   const roleRef = useRef(null);
   const iceQueueRef = useRef([]);
   const restartTimerRef = useRef(null);
+  const cameraTrackRef = useRef(null);
 
   const [localStream, setLocalStream] = useState(null);
   const [remoteStream, setRemoteStream] = useState(null);
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState(null);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [chatMessages, setChatMessages] = useState([]);
 
   /* ── Медиа ── */
 
   const acquireMedia = useCallback(async () => {
     if (localStreamRef.current) return localStreamRef.current;
     console.log("[WebRTC] Запрашиваю getUserMedia...");
-    try {
-      let stream;
+
+    const attempts = [
+      { video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true },
+      { video: true, audio: true },
+      { video: false, audio: true },
+      { video: true, audio: false },
+    ];
+
+    let stream = null;
+    for (const constraints of attempts) {
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-          audio: true,
-        });
-      } catch {
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        break;
+      } catch (err) {
+        console.warn("[WebRTC] getUserMedia fail для", constraints, ":", err.name);
       }
-      console.log("[WebRTC] getUserMedia OK, треки:",
-        stream.getTracks().map(t => `${t.kind}=${t.readyState}, label=${t.label}`));
-      localStreamRef.current = stream;
-      setLocalStream(stream);
-      return stream;
-    } catch (err) {
-      console.error("[WebRTC] getUserMedia FAIL:", err.name, err.message);
-      throw err;
     }
+
+    if (!stream) {
+      console.warn("[WebRTC] Нет доступа к камере и микрофону, подключаюсь без медиа");
+      stream = new MediaStream();
+    }
+
+    console.log("[WebRTC] getUserMedia OK, треки:",
+      stream.getTracks().map(t => `${t.kind}=${t.readyState}`));
+    localStreamRef.current = stream;
+    cameraTrackRef.current = stream.getVideoTracks()[0] || null;
+    setLocalStream(stream);
+    return stream;
   }, []);
+
+  /* ── Чат ── */
+
+  const sendChat = useCallback((text) => {
+    if (!text.trim()) return;
+    send({ type: "chat", text: text.trim() });
+    setChatMessages(prev => [...prev, { text: text.trim(), own: true, ts: Date.now() }]);
+  }, [send]);
+
+  /* ── Ренегоциация (общая) ── */
+
+  const renegotiate = useCallback(async () => {
+    const pc = pcRef.current;
+    if (!pc || pc.signalingState === "closed") return;
+    console.log("[WebRTC] Ренегоциация, signalingState:", pc.signalingState);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    send({ type: "offer", sdp: pc.localDescription });
+  }, [send]);
 
   /* ── Демонстрация экрана ── */
 
@@ -57,31 +89,26 @@ export function useWebRTC({ send, setOnMessage }) {
     if (!pc) return;
 
     try {
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true, // Chrome: системный/вкладочный звук; Firefox/Safari: игнорируется
-      });
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
       screenStreamRef.current = screenStream;
-
       const screenVideoTrack = screenStream.getVideoTracks()[0];
-      const screenAudioTrack = screenStream.getAudioTracks()[0];
+      console.log("[WebRTC] Screen track получен:", screenVideoTrack.readyState);
 
-      // Заменяем видеотрек в PeerConnection через replaceTrack
-      const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
-      if (videoSender) {
-        await videoSender.replaceTrack(screenVideoTrack);
+      // Убираем камеру из PC
+      const camSender = pc.getSenders().find(s => s.track?.kind === "video");
+      if (camSender) {
+        pc.removeTrack(camSender);
+        console.log("[WebRTC] Камера убрана из PC");
       }
 
-      // Если есть аудио от экрана — добавляем/заменяем
-      if (screenAudioTrack) {
-        const audioSenders = pc.getSenders().filter(s => s.track?.kind === "audio");
-        if (audioSenders.length > 0) {
-          // Не заменяем микрофон — добавляем второй аудиотрек
-          pc.addTrack(screenAudioTrack, screenStream);
-        }
-      }
+      // Добавляем экран
+      pc.addTrack(screenVideoTrack, screenStream);
+      console.log("[WebRTC] Screen track добавлен в PC");
 
-      // Обновляем локальный стрим для PiP-отображения
+      // Ренегоциация — ресивер получит ontrack с новым треком
+      await renegotiate();
+
+      // PiP
       const displayStream = new MediaStream([
         screenVideoTrack,
         ...(localStreamRef.current?.getAudioTracks() || []),
@@ -89,51 +116,46 @@ export function useWebRTC({ send, setOnMessage }) {
       setLocalStream(displayStream);
       setIsScreenSharing(true);
 
-      // Когда пользователь останавливает шаринг через UI браузера
-      screenVideoTrack.onended = () => {
-        stopScreenShare();
-      };
-
+      screenVideoTrack.onended = () => stopScreenShare();
       console.log("[WebRTC] Демонстрация экрана запущена");
     } catch (err) {
-      // Пользователь отменил выбор — не ошибка
       if (err.name !== "NotAllowedError") {
         console.error("[WebRTC] getDisplayMedia FAIL:", err);
       }
     }
-  }, []);
+  }, [renegotiate]);
 
   const stopScreenShare = useCallback(async () => {
     const pc = pcRef.current;
     const cameraStream = localStreamRef.current;
     const screenStream = screenStreamRef.current;
-
     if (!pc || !cameraStream) return;
+
+    // Убираем экранные sender'ы
+    pc.getSenders().forEach(sender => {
+      if (sender.track && sender.track !== cameraTrackRef.current &&
+          !cameraStream.getAudioTracks().includes(sender.track)) {
+        try { pc.removeTrack(sender); } catch { /* ok */ }
+      }
+    });
+
+    // Возвращаем камеру
+    const camTrack = cameraTrackRef.current;
+    if (camTrack && camTrack.readyState === "live") {
+      pc.addTrack(camTrack, cameraStream);
+    }
 
     // Останавливаем треки экрана
     screenStream?.getTracks().forEach(t => t.stop());
     screenStreamRef.current = null;
 
-    // Возвращаем камеру
-    const cameraVideoTrack = cameraStream.getVideoTracks()[0];
-    if (cameraVideoTrack) {
-      const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
-      if (videoSender) {
-        await videoSender.replaceTrack(cameraVideoTrack);
-      }
-    }
-
-    // Убираем добавленный аудиотрек экрана если был
-    pc.getSenders().forEach(sender => {
-      if (sender.track && !cameraStream.getTracks().includes(sender.track)) {
-        try { pc.removeTrack(sender); } catch { /* ok */ }
-      }
-    });
+    // Ренегоциация
+    await renegotiate();
 
     setLocalStream(cameraStream);
     setIsScreenSharing(false);
     console.log("[WebRTC] Демонстрация экрана остановлена");
-  }, []);
+  }, [renegotiate]);
 
   /* ── ICE Restart ── */
 
@@ -170,6 +192,7 @@ export function useWebRTC({ send, setOnMessage }) {
     setIsScreenSharing(false);
     pcRef.current?.close();
     pcRef.current = null;
+    remoteRef.current = null;
     iceQueueRef.current = [];
   }, []);
 
@@ -183,11 +206,25 @@ export function useWebRTC({ send, setOnMessage }) {
     pcRef.current = pc;
 
     const remote = new MediaStream();
+    remoteRef.current = remote;
     setRemoteStream(remote);
 
     pc.ontrack = (e) => {
-      console.log("[WebRTC] ontrack:", e.track.kind, e.track.readyState);
-      e.streams[0].getTracks().forEach((track) => remote.addTrack(track));
+      console.log("[WebRTC] ontrack:", e.track.kind, e.track.readyState, "id:", e.track.id);
+      const r = remoteRef.current;
+      if (!r) return;
+
+      // Убираем старые треки того же типа (при переключении камера↔экран)
+      r.getTracks()
+        .filter(t => t.kind === e.track.kind && t.id !== e.track.id)
+        .forEach(t => r.removeTrack(t));
+
+      r.addTrack(e.track);
+
+      // Новый MediaStream → Video перемонтирует <video> элемент
+      const ns = new MediaStream(r.getTracks());
+      remoteRef.current = ns;
+      setRemoteStream(ns);
     };
 
     pc.onicecandidate = (e) => {
@@ -221,36 +258,56 @@ export function useWebRTC({ send, setOnMessage }) {
     iceQueueRef.current = [];
   }, []);
 
+  const ensureTransceivers = useCallback((pc, stream) => {
+    stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+    const hasAudio = stream.getAudioTracks().length > 0;
+    const hasVideo = stream.getVideoTracks().length > 0;
+    if (!hasAudio) pc.addTransceiver("audio", { direction: "recvonly" });
+    if (!hasVideo) pc.addTransceiver("video", { direction: "recvonly" });
+  }, []);
+
   const startCall = useCallback(async () => {
     setStatus("connecting");
     const stream = await acquireMedia();
     const pc = await createPC();
-    stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+    ensureTransceivers(pc, stream);
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     send({ type: "offer", sdp: pc.localDescription });
-  }, [acquireMedia, createPC, send]);
+  }, [acquireMedia, createPC, ensureTransceivers, send]);
 
   const handleOffer = useCallback(
     async (sdp) => {
-      setStatus("connecting");
-      const stream = await acquireMedia();
-
       let pc = pcRef.current;
-      if (!pc || pc.signalingState === "closed") {
-        pc = await createPC();
-        stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+
+      // ── Ренегоциация: PC уже есть, НЕ пересоздаём ──
+      if (pc && pc.signalingState !== "closed") {
+        console.log("[WebRTC] handleOffer: ренегоциация, state:", pc.signalingState);
+        if (pc.signalingState === "have-local-offer") {
+          await pc.setLocalDescription({ type: "rollback" });
+        }
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        await drainIceQueue(pc);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        send({ type: "answer", sdp: pc.localDescription });
+        return;
       }
 
+      // ── Первое подключение ──
+      console.log("[WebRTC] handleOffer: новый PC");
+      setStatus("connecting");
+      const stream = await acquireMedia();
+      pc = await createPC();
+      ensureTransceivers(pc, stream);
       await pc.setRemoteDescription(new RTCSessionDescription(sdp));
       await drainIceQueue(pc);
-
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       send({ type: "answer", sdp: pc.localDescription });
     },
-    [acquireMedia, createPC, drainIceQueue, send],
+    [acquireMedia, createPC, ensureTransceivers, drainIceQueue, send],
   );
 
   const handleAnswer = useCallback(
@@ -264,6 +321,7 @@ export function useWebRTC({ send, setOnMessage }) {
   );
 
   const handleIceCandidate = useCallback(async (candidate) => {
+    if (!candidate?.candidate) return;
     const pc = pcRef.current;
     if (pc?.remoteDescription) {
       await pc.addIceCandidate(new RTCIceCandidate(candidate));
@@ -276,9 +334,11 @@ export function useWebRTC({ send, setOnMessage }) {
     closePc();
     localStreamRef.current?.getTracks().forEach((t) => t.stop());
     localStreamRef.current = null;
+    cameraTrackRef.current = null;
     setLocalStream(null);
     setRemoteStream(null);
     setStatus("idle");
+    setChatMessages([]);
   }, [closePc]);
 
   /* ── Подписка WS ── */
@@ -305,6 +365,9 @@ export function useWebRTC({ send, setOnMessage }) {
           case "ice-candidate":
             await handleIceCandidate(data.candidate);
             break;
+          case "chat":
+            setChatMessages(prev => [...prev, { text: data.text, own: false, ts: Date.now() }]);
+            break;
           case "peer_disconnected":
             closePc();
             setRemoteStream(null);
@@ -324,5 +387,6 @@ export function useWebRTC({ send, setOnMessage }) {
   return {
     localStream, remoteStream, status, error, cleanup,
     isScreenSharing, startScreenShare, stopScreenShare,
+    chatMessages, sendChat,
   };
 }
