@@ -1,4 +1,3 @@
-// frontend/src/App.jsx
 import { useState, useRef, useEffect, useCallback } from "react";
 import { useSignaling } from "./useSignaling";
 import { useWebRTC } from "./useWebRTC";
@@ -47,10 +46,8 @@ function useTheme() {
 
 /* ── Видео-компонент ──────────────────────────────────────────────── */
 
-function Video({ stream, muted = false, volume = 1, className = "", adaptAspect = false, containerRef: externalRef }) {
+function Video({ stream, muted = false, volume = 1, className = "" }) {
   const videoRef = useRef(null);
-  const internalContainerRef = useRef(null);
-  const containerRef = externalRef || internalContainerRef;
 
   useEffect(() => {
     const el = videoRef.current;
@@ -68,25 +65,8 @@ function Video({ stream, muted = false, volume = 1, className = "", adaptAspect 
     if (!muted) el.volume = volume;
   }, [muted, volume]);
 
-  useEffect(() => {
-    if (!adaptAspect) return;
-    const el = videoRef.current;
-    const container = typeof containerRef === "object" ? containerRef.current : null;
-    if (!el || !container) return;
-    const update = () => {
-      if (el.videoWidth && el.videoHeight)
-        container.style.aspectRatio = `${el.videoWidth} / ${el.videoHeight}`;
-    };
-    el.addEventListener("resize", update);
-    el.addEventListener("loadedmetadata", update);
-    return () => {
-      el.removeEventListener("resize", update);
-      el.removeEventListener("loadedmetadata", update);
-    };
-  }, [adaptAspect, containerRef]);
-
   return (
-    <div className={className} ref={externalRef ? undefined : internalContainerRef}>
+    <div className={className}>
       <video ref={videoRef} playsInline autoPlay muted={muted} />
     </div>
   );
@@ -96,32 +76,55 @@ function Video({ stream, muted = false, volume = 1, className = "", adaptAspect 
 
 function ResizablePip({ stream, visible }) {
   const wrapperRef = useRef(null);
-  const pipRef = useRef(null);
+  const videoRef = useRef(null);
   const dragging = useRef(false);
   const startData = useRef(null);
 
+  /* Привязка стрима к <video> + адаптация aspect-ratio */
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    if (!stream) { el.srcObject = null; return; }
+    if (el.srcObject !== stream) el.srcObject = stream;
+    el.play().catch(() => { el.muted = true; el.play().catch(() => {}); });
+
+    const updateAspect = () => {
+      const w = wrapperRef.current;
+      if (w && el.videoWidth && el.videoHeight) {
+        w.style.aspectRatio = `${el.videoWidth} / ${el.videoHeight}`;
+      }
+    };
+    el.addEventListener("resize", updateAspect);
+    el.addEventListener("loadedmetadata", updateAspect);
+
+    return () => {
+      el.removeEventListener("resize", updateAspect);
+      el.removeEventListener("loadedmetadata", updateAspect);
+      el.srcObject = null;
+    };
+  }, [stream]);
+
+  /* Pointer-based ресайз за левый нижний угол */
   const onPointerDown = useCallback((e) => {
     e.preventDefault();
     e.stopPropagation();
+    const w = wrapperRef.current;
+    if (!w) return;
     dragging.current = true;
-    const pip = pipRef.current;
-    if (!pip) return;
-    startData.current = {
-      x: e.clientX,
-      y: e.clientY,
-      w: pip.offsetWidth,
-    };
-    wrapperRef.current?.classList.add("pip-resizing");
+    startData.current = { x: e.clientX, w: w.offsetWidth };
+    w.classList.add("pip-resizing");
     document.addEventListener("pointermove", onPointerMove);
     document.addEventListener("pointerup", onPointerUp);
   }, []);
 
   const onPointerMove = useCallback((e) => {
-    if (!dragging.current || !startData.current || !pipRef.current) return;
-    // Тянем за левый нижний угол → dx отрицательный = увеличение
+    if (!dragging.current || !startData.current) return;
+    const w = wrapperRef.current;
+    if (!w) return;
+    // Тянем влево → увеличиваем, вправо → уменьшаем
     const dx = startData.current.x - e.clientX;
     const newW = Math.max(90, Math.min(400, startData.current.w + dx));
-    pipRef.current.style.width = `${newW}px`;
+    w.style.width = `${newW}px`;
   }, []);
 
   const onPointerUp = useCallback(() => {
@@ -137,14 +140,14 @@ function ResizablePip({ stream, visible }) {
       className={`pip-wrapper ${visible ? "" : "pip-hidden"}`}
       ref={wrapperRef}
     >
-      <Video
-        stream={stream}
-        muted
-        className="pip-video"
-        adaptAspect
-        containerRef={pipRef}
-      />
-      <div className="pip-resize-handle" onPointerDown={onPointerDown}>
+      <div className="pip-video">
+        <video ref={videoRef} playsInline autoPlay muted />
+      </div>
+      <div
+        className="pip-resize-handle"
+        onPointerDown={onPointerDown}
+        style={{ touchAction: "none" }}
+      >
         <IconResize />
       </div>
     </div>
