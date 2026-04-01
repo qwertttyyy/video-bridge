@@ -11,7 +11,7 @@ import { useRef, useState, useCallback, useEffect } from "react";
 
 // ── Настраиваемые константы ──────────────────────────────────────────
 const ICE_RESTART_DELAY = 2500;
-const CONNECTION_TIMEOUT = 8000;    // Таймаут на установку соединения (мс)
+const CONNECTION_TIMEOUT = 5000;    // Таймаут на установку соединения (мс)
 const CANDIDATE_POOL_SIZE = 4;      // Пре-сбор ICE-кандидатов
 const JITTER_BUFFER_MS = 50;        // Целевой jitter buffer (мс)
 const MAX_VIDEO_BITRATE = 2_500_000; // Макс. битрейт видео (bps)

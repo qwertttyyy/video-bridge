@@ -1,3 +1,4 @@
+// frontend/src/App.jsx
 import { useState, useRef, useEffect, useCallback } from "react";
 import { useSignaling } from "./useSignaling";
 import { useWebRTC } from "./useWebRTC";
@@ -6,6 +7,7 @@ import {
   IconScreenShare, IconScreenShareActive, IconHangUp,
   IconVolumeHigh, IconVolumeLow, IconVolumeMute,
   IconLink, IconCheck, IconSun, IconMoon, IconBridge, IconUser,
+  IconEye, IconEyeOff, IconResize,
 } from "./Icons";
 import "./App.css";
 
@@ -45,9 +47,10 @@ function useTheme() {
 
 /* ── Видео-компонент ──────────────────────────────────────────────── */
 
-function Video({ stream, muted = false, volume = 1, className = "", adaptAspect = false }) {
+function Video({ stream, muted = false, volume = 1, className = "", adaptAspect = false, containerRef: externalRef }) {
   const videoRef = useRef(null);
-  const containerRef = useRef(null);
+  const internalContainerRef = useRef(null);
+  const containerRef = externalRef || internalContainerRef;
 
   useEffect(() => {
     const el = videoRef.current;
@@ -68,7 +71,7 @@ function Video({ stream, muted = false, volume = 1, className = "", adaptAspect 
   useEffect(() => {
     if (!adaptAspect) return;
     const el = videoRef.current;
-    const container = containerRef.current;
+    const container = typeof containerRef === "object" ? containerRef.current : null;
     if (!el || !container) return;
     const update = () => {
       if (el.videoWidth && el.videoHeight)
@@ -80,11 +83,70 @@ function Video({ stream, muted = false, volume = 1, className = "", adaptAspect 
       el.removeEventListener("resize", update);
       el.removeEventListener("loadedmetadata", update);
     };
-  }, [adaptAspect]);
+  }, [adaptAspect, containerRef]);
 
   return (
-    <div className={className} ref={containerRef}>
+    <div className={className} ref={externalRef ? undefined : internalContainerRef}>
       <video ref={videoRef} playsInline autoPlay muted={muted} />
+    </div>
+  );
+}
+
+/* ── Ресайз PiP ──────────────────────────────────────────────────── */
+
+function ResizablePip({ stream, visible }) {
+  const wrapperRef = useRef(null);
+  const pipRef = useRef(null);
+  const dragging = useRef(false);
+  const startData = useRef(null);
+
+  const onPointerDown = useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragging.current = true;
+    const pip = pipRef.current;
+    if (!pip) return;
+    startData.current = {
+      x: e.clientX,
+      y: e.clientY,
+      w: pip.offsetWidth,
+    };
+    wrapperRef.current?.classList.add("pip-resizing");
+    document.addEventListener("pointermove", onPointerMove);
+    document.addEventListener("pointerup", onPointerUp);
+  }, []);
+
+  const onPointerMove = useCallback((e) => {
+    if (!dragging.current || !startData.current || !pipRef.current) return;
+    // Тянем за левый нижний угол → dx отрицательный = увеличение
+    const dx = startData.current.x - e.clientX;
+    const newW = Math.max(90, Math.min(400, startData.current.w + dx));
+    pipRef.current.style.width = `${newW}px`;
+  }, []);
+
+  const onPointerUp = useCallback(() => {
+    dragging.current = false;
+    startData.current = null;
+    wrapperRef.current?.classList.remove("pip-resizing");
+    document.removeEventListener("pointermove", onPointerMove);
+    document.removeEventListener("pointerup", onPointerUp);
+  }, [onPointerMove]);
+
+  return (
+    <div
+      className={`pip-wrapper ${visible ? "" : "pip-hidden"}`}
+      ref={wrapperRef}
+    >
+      <Video
+        stream={stream}
+        muted
+        className="pip-video"
+        adaptAspect
+        containerRef={pipRef}
+      />
+      <div className="pip-resize-handle" onPointerDown={onPointerDown}>
+        <IconResize />
+      </div>
     </div>
   );
 }
@@ -166,6 +228,7 @@ function Lobby({ onJoin, initialKey, theme, onToggleTheme }) {
 function MediaControls({
   localStream, volume, onVolumeChange, onHangUp,
   isScreenSharing, onStartScreen, onStopScreen,
+  pipVisible, onTogglePip,
 }) {
   const [camOn, setCamOn] = useState(true);
   const [micOn, setMicOn] = useState(true);
@@ -214,6 +277,15 @@ function MediaControls({
         {isScreenSharing ? <IconScreenShareActive /> : <IconScreenShare />}
       </button>
 
+      {/* Скрыть/показать своё видео (не отключает камеру для собеседника) */}
+      <button
+        className={`ctrl-btn ${pipVisible ? "" : "ctrl-off"}`}
+        onClick={onTogglePip}
+        title={pipVisible ? "Скрыть своё видео" : "Показать своё видео"}
+      >
+        {pipVisible ? <IconEye /> : <IconEyeOff />}
+      </button>
+
       <div className="volume-control">
         <span className="volume-icon"><VolumeIcon /></span>
         <input
@@ -233,7 +305,7 @@ function MediaControls({
 /* ── Видеозвонок ──────────────────────────────────────────────────── */
 
 const STATUS_TEXT = {
-  idle: "Подготовка…",
+  idle: "",
   waiting: "Ожидание собеседника…",
   connecting: "Соединение…",
   connected: "",
@@ -248,7 +320,8 @@ function Call({
 }) {
   const [peerVolume, setPeerVolume] = useState(1);
   const [copied, setCopied] = useState(false);
-  const statusMsg = STATUS_TEXT[status] ?? status;
+  const [pipVisible, setPipVisible] = useState(true);
+  const statusMsg = STATUS_TEXT[status] ?? "";
 
   const handleCopyLink = async () => {
     const ok = await copyToClipboard(buildInviteLink(sessionKey));
@@ -258,6 +331,9 @@ function Call({
     }
   };
 
+  /* Плейсхолдер показываем только когда нет remote stream */
+  const showPlaceholder = !remoteStream;
+
   return (
     <div className="call">
       {remoteStream ? (
@@ -265,14 +341,14 @@ function Call({
       ) : (
         <div className="remote-video remote-placeholder">
           <IconUser />
-          <span>{statusMsg || "Ожидание собеседника…"}</span>
         </div>
       )}
 
       {localStream && (
-        <Video stream={localStream} muted className="pip-video" adaptAspect />
+        <ResizablePip stream={localStream} visible={pipVisible} />
       )}
 
+      {/* Единственный статус-оверлей: показывается всегда когда есть текст */}
       {statusMsg && (
         <div className={`status-overlay status-${status}`}>{statusMsg}</div>
       )}
@@ -299,6 +375,8 @@ function Call({
         isScreenSharing={isScreenSharing}
         onStartScreen={onStartScreen}
         onStopScreen={onStopScreen}
+        pipVisible={pipVisible}
+        onTogglePip={() => setPipVisible(v => !v)}
       />
     </div>
   );
