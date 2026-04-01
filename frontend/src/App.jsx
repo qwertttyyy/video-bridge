@@ -1,7 +1,12 @@
-// frontend/src/App.jsx
 import { useState, useRef, useEffect, useCallback } from "react";
 import { useSignaling } from "./useSignaling";
 import { useWebRTC } from "./useWebRTC";
+import {
+  IconVideo, IconVideoOff, IconMic, IconMicOff,
+  IconScreenShare, IconScreenShareActive, IconHangUp,
+  IconVolumeHigh, IconVolumeLow, IconVolumeMute,
+  IconLink, IconCheck, IconSun, IconMoon, IconBridge, IconUser,
+} from "./Icons";
 import "./App.css";
 
 const genClientId = () => crypto.randomUUID().slice(0, 8);
@@ -9,19 +14,34 @@ const genClientId = () => crypto.randomUUID().slice(0, 8);
 const buildInviteLink = (key) =>
   `${window.location.origin}?session=${key}`;
 
-const getSessionFromUrl = () => {
-  const params = new URLSearchParams(window.location.search);
-  return params.get("session");
-};
+const getSessionFromUrl = () =>
+  new URLSearchParams(window.location.search).get("session");
 
 const copyToClipboard = async (text) => {
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch {
-    return false;
-  }
+  try { await navigator.clipboard.writeText(text); return true; }
+  catch { return false; }
 };
+
+/* ── Тема ─────────────────────────────────────────────────────────── */
+
+function useTheme() {
+  const [theme, setTheme] = useState(() => {
+    const saved = localStorage.getItem("vb-theme");
+    if (saved) return saved;
+    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  });
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("vb-theme", theme);
+  }, [theme]);
+
+  const toggle = useCallback(() => {
+    setTheme(prev => prev === "dark" ? "light" : "dark");
+  }, []);
+
+  return { theme, toggle };
+}
 
 /* ── Видео-компонент ──────────────────────────────────────────────── */
 
@@ -32,32 +52,12 @@ function Video({ stream, muted = false, volume = 1, className = "", adaptAspect 
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
-
-    if (!stream) {
-      el.srcObject = null;
-      return;
-    }
-
-    // Переназначаем srcObject только если стрим сменился
-    if (el.srcObject !== stream) {
-      el.srcObject = stream;
-    }
-
-    const play = () => {
-      el.play().catch(() => {
-        // Autoplay blocked — попробуем muted
-        el.muted = true;
-        el.play().catch(() => {});
-      });
-    };
-    play();
-
-    return () => {
-      el.srcObject = null;
-    };
+    if (!stream) { el.srcObject = null; return; }
+    if (el.srcObject !== stream) el.srcObject = stream;
+    el.play().catch(() => { el.muted = true; el.play().catch(() => {}); });
+    return () => { el.srcObject = null; };
   }, [stream]);
 
-  // Громкость и mute — отдельный effect чтобы не пересоздавать видео
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
@@ -65,48 +65,38 @@ function Video({ stream, muted = false, volume = 1, className = "", adaptAspect 
     if (!muted) el.volume = volume;
   }, [muted, volume]);
 
-  // Адаптация aspect-ratio контейнера
   useEffect(() => {
     if (!adaptAspect) return;
     const el = videoRef.current;
     const container = containerRef.current;
     if (!el || !container) return;
-
-    const updateAspect = () => {
-      if (el.videoWidth && el.videoHeight) {
+    const update = () => {
+      if (el.videoWidth && el.videoHeight)
         container.style.aspectRatio = `${el.videoWidth} / ${el.videoHeight}`;
-      }
     };
-
-    el.addEventListener("resize", updateAspect);
-    el.addEventListener("loadedmetadata", updateAspect);
+    el.addEventListener("resize", update);
+    el.addEventListener("loadedmetadata", update);
     return () => {
-      el.removeEventListener("resize", updateAspect);
-      el.removeEventListener("loadedmetadata", updateAspect);
+      el.removeEventListener("resize", update);
+      el.removeEventListener("loadedmetadata", update);
     };
   }, [adaptAspect]);
 
   return (
     <div className={className} ref={containerRef}>
-      <video
-        ref={videoRef}
-        playsInline
-        autoPlay
-        muted={muted}
-      />
+      <video ref={videoRef} playsInline autoPlay muted={muted} />
     </div>
   );
 }
 
 /* ── Лобби ────────────────────────────────────────────────────────── */
 
-function Lobby({ onJoin, initialKey }) {
+function Lobby({ onJoin, initialKey, theme, onToggleTheme }) {
   const [key, setKey] = useState(initialKey || "");
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
   const joinedRef = useRef(false);
 
-  // Автоподключение по ссылке — один раз
   useEffect(() => {
     if (initialKey && !joinedRef.current) {
       joinedRef.current = true;
@@ -120,10 +110,7 @@ function Lobby({ onJoin, initialKey }) {
     try {
       const res = await fetch("/api/sessions", { method: "POST" });
       const data = await res.json();
-      if (data.error) {
-        setErrorMsg(data.message);
-        return;
-      }
+      if (data.error) { setErrorMsg(data.message); return; }
       await copyToClipboard(buildInviteLink(data.sessionKey));
       onJoin(data.sessionKey, true);
     } catch {
@@ -140,13 +127,20 @@ function Lobby({ onJoin, initialKey }) {
 
   return (
     <div className="lobby">
-      <h1>Video Bridge</h1>
-      <p className="subtitle">WebRTC видеомост для двоих</p>
+      <button className="theme-toggle" onClick={onToggleTheme} title="Сменить тему">
+        {theme === "dark" ? <IconSun /> : <IconMoon />}
+      </button>
+
+      <div className="lobby-logo">
+        <IconBridge />
+        <h1>Video Bridge</h1>
+      </div>
+      <p className="subtitle">Приватный видеомост для двоих</p>
 
       {errorMsg && <p className="lobby-error">{errorMsg}</p>}
 
       <button className="btn btn-primary" onClick={handleCreate} disabled={loading}>
-        {loading ? "Создаю..." : "Создать сессию"}
+        {loading ? "Создаю…" : "Создать сессию"}
       </button>
 
       <div className="divider">или</div>
@@ -160,7 +154,7 @@ function Lobby({ onJoin, initialKey }) {
           onKeyDown={(e) => e.key === "Enter" && handleJoin()}
         />
         <button className="btn btn-secondary" onClick={handleJoin} disabled={!key.trim()}>
-          Подключиться
+          Войти
         </button>
       </div>
     </div>
@@ -192,6 +186,8 @@ function MediaControls({
     setMicOn(track.enabled);
   };
 
+  const VolumeIcon = volume === 0 ? IconVolumeMute : volume < 0.5 ? IconVolumeLow : IconVolumeHigh;
+
   return (
     <div className="controls-bar">
       <button
@@ -199,7 +195,7 @@ function MediaControls({
         onClick={toggleMic}
         title={micOn ? "Выключить микрофон" : "Включить микрофон"}
       >
-        {micOn ? "\u{1F3A4}" : "\u{1F507}"}
+        {micOn ? <IconMic /> : <IconMicOff />}
       </button>
 
       <button
@@ -207,7 +203,7 @@ function MediaControls({
         onClick={toggleCam}
         title={camOn ? "Выключить камеру" : "Включить камеру"}
       >
-        {camOn ? "\u{1F4F7}" : "\u{1F6AB}"}
+        {camOn ? <IconVideo /> : <IconVideoOff />}
       </button>
 
       <button
@@ -215,13 +211,11 @@ function MediaControls({
         onClick={isScreenSharing ? onStopScreen : onStartScreen}
         title={isScreenSharing ? "Остановить демонстрацию" : "Демонстрация экрана"}
       >
-        {isScreenSharing ? "\u{1F7E9}" : "\u{1F5A5}\u{FE0F}"}
+        {isScreenSharing ? <IconScreenShareActive /> : <IconScreenShare />}
       </button>
 
       <div className="volume-control">
-        <span className="volume-icon">
-          {volume === 0 ? "\u{1F507}" : volume < 0.5 ? "\u{1F509}" : "\u{1F50A}"}
-        </span>
+        <span className="volume-icon"><VolumeIcon /></span>
         <input
           type="range" min="0" max="1" step="0.05"
           value={volume}
@@ -230,7 +224,7 @@ function MediaControls({
       </div>
 
       <button className="ctrl-btn ctrl-hangup" onClick={onHangUp} title="Завершить">
-        {"\u{1F4F5}"}
+        <IconHangUp />
       </button>
     </div>
   );
@@ -249,7 +243,8 @@ const STATUS_TEXT = {
 
 function Call({
   sessionKey, localStream, remoteStream, status, onHangUp,
-  isCreator, isScreenSharing, onStartScreen, onStopScreen,
+  isScreenSharing, onStartScreen, onStopScreen,
+  theme, onToggleTheme,
 }) {
   const [peerVolume, setPeerVolume] = useState(1);
   const [copied, setCopied] = useState(false);
@@ -269,6 +264,7 @@ function Call({
         <Video stream={remoteStream} volume={peerVolume} className="remote-video" />
       ) : (
         <div className="remote-video remote-placeholder">
+          <IconUser />
           <span>{statusMsg || "Ожидание собеседника…"}</span>
         </div>
       )}
@@ -282,10 +278,17 @@ function Call({
       )}
 
       <div className="top-bar">
-        <span className="session-badge">{sessionKey}</span>
-        <button className="copy-link-btn" onClick={handleCopyLink}>
-          {copied ? "\u{2705} Скопировано" : "\u{1F517} Скопировать ссылку"}
-        </button>
+        <div className="top-bar-left">
+          <span className="session-badge">{sessionKey}</span>
+          <button className="top-action-btn" onClick={handleCopyLink}>
+            {copied ? <><IconCheck /> Скопировано</> : <><IconLink /> Ссылка</>}
+          </button>
+        </div>
+        <div className="top-bar-right">
+          <button className="theme-toggle-call" onClick={onToggleTheme} title="Сменить тему">
+            {theme === "dark" ? <IconSun /> : <IconMoon />}
+          </button>
+        </div>
       </div>
 
       <MediaControls
@@ -306,6 +309,7 @@ function Call({
 export default function App() {
   const [sessionKey, setSessionKey] = useState(null);
   const [isCreator, setIsCreator] = useState(false);
+  const { theme, toggle: toggleTheme } = useTheme();
   const signaling = useSignaling();
   const {
     localStream, remoteStream, status, error, cleanup,
@@ -340,7 +344,7 @@ export default function App() {
     return (
       <div className="lobby">
         <h2>Ошибка</h2>
-        <p>{error}</p>
+        <p className="subtitle">{error}</p>
         <button className="btn btn-primary" onClick={() => window.location.reload()}>
           Перезагрузить
         </button>
@@ -349,7 +353,14 @@ export default function App() {
   }
 
   if (!sessionKey) {
-    return <Lobby onJoin={handleJoin} initialKey={urlSessionKey} />;
+    return (
+      <Lobby
+        onJoin={handleJoin}
+        initialKey={urlSessionKey}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+      />
+    );
   }
 
   return (
@@ -363,6 +374,8 @@ export default function App() {
       isScreenSharing={isScreenSharing}
       onStartScreen={startScreenShare}
       onStopScreen={stopScreenShare}
+      theme={theme}
+      onToggleTheme={toggleTheme}
     />
   );
 }
