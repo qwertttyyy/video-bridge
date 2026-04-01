@@ -6,17 +6,14 @@ import "./App.css";
 
 const genClientId = () => crypto.randomUUID().slice(0, 8);
 
-/** Строит ссылку-приглашение по ключу сессии */
 const buildInviteLink = (key) =>
   `${window.location.origin}?session=${key}`;
 
-/** Читает ключ сессии из URL (?session=KEY) */
 const getSessionFromUrl = () => {
   const params = new URLSearchParams(window.location.search);
   return params.get("session");
 };
 
-/** Копирует текст в буфер обмена, возвращает true при успехе */
 const copyToClipboard = async (text) => {
   try {
     await navigator.clipboard.writeText(text);
@@ -26,107 +23,79 @@ const copyToClipboard = async (text) => {
   }
 };
 
-/* ── Компонент видео ──────────────────────────────────────────────── */
+/* ── Видео-компонент ──────────────────────────────────────────────── */
 
 function Video({ stream, muted = false, volume = 1, className = "", adaptAspect = false }) {
+  const videoRef = useRef(null);
   const containerRef = useRef(null);
-  const cleanupRef = useRef(null);
 
   useEffect(() => {
-    const container = containerRef.current;
-    if (!container || !stream) return;
+    const el = videoRef.current;
+    if (!el) return;
 
-    if (cleanupRef.current) cleanupRef.current();
-    container.querySelectorAll("video, canvas").forEach((el) => el.remove());
-
-    const el = document.createElement("video");
-    el.playsInline = true;
-    el.autoplay = true;
-    el.muted = true;
-    el.setAttribute("playsinline", "");
-    el.setAttribute("webkit-playsinline", "");
-    el.srcObject = stream;
-    container.prepend(el);
-
-    // Адаптация aspect-ratio контейнера под реальное видео (для PiP)
-    const updateAspect = () => {
-      if (!adaptAspect || !el.videoWidth || !el.videoHeight) return;
-      container.style.aspectRatio = `${el.videoWidth} / ${el.videoHeight}`;
-    };
-    el.addEventListener("resize", updateAspect);
-    el.addEventListener("loadedmetadata", updateAspect);
-
-    const playPromise = el.play();
-    let fallbackTimer = null;
-    let canvasRAF = null;
-
-    if (playPromise) {
-      playPromise.then(() => {
-        if (!muted) {
-          el.muted = false;
-          el.volume = volume;
-        }
-        updateAspect();
-      }).catch(() => {});
+    if (!stream) {
+      el.srcObject = null;
+      return;
     }
 
-    fallbackTimer = setTimeout(() => {
-      if (el.videoWidth > 0) return;
-      const videoTrack = stream.getVideoTracks()[0];
-      if (!videoTrack || typeof ImageCapture === "undefined") return;
+    // Переназначаем srcObject только если стрим сменился
+    if (el.srcObject !== stream) {
+      el.srcObject = stream;
+    }
 
-      const capture = new ImageCapture(videoTrack);
-      const canvas = document.createElement("canvas");
-      el.style.display = "none";
-      container.prepend(canvas);
-      const ctx = canvas.getContext("2d");
-      let running = true;
-      async function drawLoop() {
-        if (!running) return;
-        try {
-          const bitmap = await capture.grabFrame();
-          if (canvas.width !== bitmap.width) canvas.width = bitmap.width;
-          if (canvas.height !== bitmap.height) canvas.height = bitmap.height;
-          ctx.drawImage(bitmap, 0, 0);
-          bitmap.close();
-          if (adaptAspect) {
-            container.style.aspectRatio = `${bitmap.width} / ${bitmap.height}`;
-          }
-        } catch { /* ended */ }
-        canvasRAF = requestAnimationFrame(drawLoop);
-      }
-      drawLoop();
-      cleanupRef.current = () => {
-        running = false;
-        if (canvasRAF) cancelAnimationFrame(canvasRAF);
-        el.srcObject = null;
-        canvas.remove();
-        el.remove();
-      };
-    }, 1500);
-
-    cleanupRef.current = () => {
-      clearTimeout(fallbackTimer);
-      if (canvasRAF) cancelAnimationFrame(canvasRAF);
-      el.removeEventListener("resize", updateAspect);
-      el.removeEventListener("loadedmetadata", updateAspect);
-      el.srcObject = null;
-      el.remove();
+    const play = () => {
+      el.play().catch(() => {
+        // Autoplay blocked — попробуем muted
+        el.muted = true;
+        el.play().catch(() => {});
+      });
     };
+    play();
 
-    return () => { if (cleanupRef.current) cleanupRef.current(); };
-  }, [stream, adaptAspect]);
+    return () => {
+      el.srcObject = null;
+    };
+  }, [stream]);
 
+  // Громкость и mute — отдельный effect чтобы не пересоздавать видео
   useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-    const el = container.querySelector("video");
+    const el = videoRef.current;
     if (!el) return;
     el.muted = muted;
     if (!muted) el.volume = volume;
   }, [muted, volume]);
 
-  return <div className={className} ref={containerRef} />;
+  // Адаптация aspect-ratio контейнера
+  useEffect(() => {
+    if (!adaptAspect) return;
+    const el = videoRef.current;
+    const container = containerRef.current;
+    if (!el || !container) return;
+
+    const updateAspect = () => {
+      if (el.videoWidth && el.videoHeight) {
+        container.style.aspectRatio = `${el.videoWidth} / ${el.videoHeight}`;
+      }
+    };
+
+    el.addEventListener("resize", updateAspect);
+    el.addEventListener("loadedmetadata", updateAspect);
+    return () => {
+      el.removeEventListener("resize", updateAspect);
+      el.removeEventListener("loadedmetadata", updateAspect);
+    };
+  }, [adaptAspect]);
+
+  return (
+    <div className={className} ref={containerRef}>
+      <video
+        ref={videoRef}
+        playsInline
+        autoPlay
+        muted={muted}
+      />
+    </div>
+  );
 }
 
 /* ── Лобби ────────────────────────────────────────────────────────── */
@@ -135,10 +104,14 @@ function Lobby({ onJoin, initialKey }) {
   const [key, setKey] = useState(initialKey || "");
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
+  const joinedRef = useRef(false);
 
-  // Автоподключение по ссылке
+  // Автоподключение по ссылке — один раз
   useEffect(() => {
-    if (initialKey) onJoin(initialKey, false);
+    if (initialKey && !joinedRef.current) {
+      joinedRef.current = true;
+      onJoin(initialKey, false);
+    }
   }, [initialKey, onJoin]);
 
   const handleCreate = async () => {
@@ -151,9 +124,10 @@ function Lobby({ onJoin, initialKey }) {
         setErrorMsg(data.message);
         return;
       }
-      // Копируем ссылку-приглашение в буфер
       await copyToClipboard(buildInviteLink(data.sessionKey));
       onJoin(data.sessionKey, true);
+    } catch {
+      setErrorMsg("Не удалось создать сессию. Проверьте соединение.");
     } finally {
       setLoading(false);
     }
@@ -307,7 +281,6 @@ function Call({
         <div className={`status-overlay status-${status}`}>{statusMsg}</div>
       )}
 
-      {/* Верхняя панель */}
       <div className="top-bar">
         <span className="session-badge">{sessionKey}</span>
         <button className="copy-link-btn" onClick={handleCopyLink}>
@@ -345,7 +318,6 @@ export default function App() {
     (key, creator = false) => {
       setSessionKey(key);
       setIsCreator(creator);
-      // Записываем ключ в URL без перезагрузки
       const url = new URL(window.location.href);
       url.searchParams.set("session", key);
       window.history.replaceState(null, "", url.toString());
@@ -359,7 +331,6 @@ export default function App() {
     signaling.disconnect();
     setSessionKey(null);
     setIsCreator(false);
-    // Убираем ключ из URL
     const url = new URL(window.location.href);
     url.searchParams.delete("session");
     window.history.replaceState(null, "", url.pathname);
