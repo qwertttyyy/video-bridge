@@ -1,3 +1,4 @@
+// frontend/src/App.jsx
 import { useState, useRef, useEffect, useCallback } from "react";
 import { useSignaling } from "./useSignaling";
 import { useWebRTC } from "./useWebRTC";
@@ -11,16 +12,10 @@ import {
 import "./App.css";
 
 const genClientId = () => crypto.randomUUID().slice(0, 8);
-
-const buildInviteLink = (key) =>
-  `${window.location.origin}?session=${key}`;
-
-const getSessionFromUrl = () =>
-  new URLSearchParams(window.location.search).get("session");
-
+const buildInviteLink = (key) => `${window.location.origin}?session=${key}`;
+const getSessionFromUrl = () => new URLSearchParams(window.location.search).get("session");
 const copyToClipboard = async (text) => {
-  try { await navigator.clipboard.writeText(text); return true; }
-  catch { return false; }
+  try { await navigator.clipboard.writeText(text); return true; } catch { return false; }
 };
 
 /* ── Тема ─────────────────────────────────────────────────────────── */
@@ -31,20 +26,15 @@ function useTheme() {
     if (saved) return saved;
     return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
   });
-
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem("vb-theme", theme);
   }, [theme]);
-
-  const toggle = useCallback(() => {
-    setTheme(prev => prev === "dark" ? "light" : "dark");
-  }, []);
-
+  const toggle = useCallback(() => setTheme(p => p === "dark" ? "light" : "dark"), []);
   return { theme, toggle };
 }
 
-/* ── Видео-компонент ──────────────────────────────────────────────── */
+/* ── Видео-компонент (для remote) ─────────────────────────────────── */
 
 function Video({ stream, muted = false, volume = 1, className = "" }) {
   const videoRef = useRef(null);
@@ -72,15 +62,16 @@ function Video({ stream, muted = false, volume = 1, className = "" }) {
   );
 }
 
-/* ── Ресайз PiP ──────────────────────────────────────────────────── */
+/* ── PiP с ресайзом ──────────────────────────────────────────────── */
 
 function ResizablePip({ stream, visible }) {
   const wrapperRef = useRef(null);
+  const pipVideoRef = useRef(null);
   const videoRef = useRef(null);
   const dragging = useRef(false);
   const startData = useRef(null);
 
-  /* Привязка стрима к <video> + адаптация aspect-ratio */
+  /* Привязка стрима + aspect-ratio на .pip-video */
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
@@ -89,14 +80,13 @@ function ResizablePip({ stream, visible }) {
     el.play().catch(() => { el.muted = true; el.play().catch(() => {}); });
 
     const updateAspect = () => {
-      const w = wrapperRef.current;
-      if (w && el.videoWidth && el.videoHeight) {
-        w.style.aspectRatio = `${el.videoWidth} / ${el.videoHeight}`;
+      const pipDiv = pipVideoRef.current;
+      if (pipDiv && el.videoWidth && el.videoHeight) {
+        pipDiv.style.aspectRatio = `${el.videoWidth} / ${el.videoHeight}`;
       }
     };
     el.addEventListener("resize", updateAspect);
     el.addEventListener("loadedmetadata", updateAspect);
-
     return () => {
       el.removeEventListener("resize", updateAspect);
       el.removeEventListener("loadedmetadata", updateAspect);
@@ -104,7 +94,7 @@ function ResizablePip({ stream, visible }) {
     };
   }, [stream]);
 
-  /* Pointer-based ресайз за левый нижний угол */
+  /* Ресайз за левый нижний угол */
   const onPointerDown = useCallback((e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -121,9 +111,9 @@ function ResizablePip({ stream, visible }) {
     if (!dragging.current || !startData.current) return;
     const w = wrapperRef.current;
     if (!w) return;
-    // Тянем влево → увеличиваем, вправо → уменьшаем
     const dx = startData.current.x - e.clientX;
-    const newW = Math.max(90, Math.min(400, startData.current.w + dx));
+    const maxW = Math.min(400, window.innerWidth * 0.6);
+    const newW = Math.max(80, Math.min(maxW, startData.current.w + dx));
     w.style.width = `${newW}px`;
   }, []);
 
@@ -140,13 +130,12 @@ function ResizablePip({ stream, visible }) {
       className={`pip-wrapper ${visible ? "" : "pip-hidden"}`}
       ref={wrapperRef}
     >
-      <div className="pip-video">
+      <div className="pip-video" ref={pipVideoRef}>
         <video ref={videoRef} playsInline autoPlay muted />
       </div>
       <div
         className="pip-resize-handle"
         onPointerDown={onPointerDown}
-        style={{ touchAction: "none" }}
       >
         <IconResize />
       </div>
@@ -195,21 +184,16 @@ function Lobby({ onJoin, initialKey, theme, onToggleTheme }) {
       <button className="theme-toggle" onClick={onToggleTheme} title="Сменить тему">
         {theme === "dark" ? <IconSun /> : <IconMoon />}
       </button>
-
       <div className="lobby-logo">
         <IconBridge />
         <h1>Video Bridge</h1>
       </div>
       <p className="subtitle">Приватный видеомост для двоих</p>
-
       {errorMsg && <p className="lobby-error">{errorMsg}</p>}
-
       <button className="btn btn-primary" onClick={handleCreate} disabled={loading}>
         {loading ? "Создаю…" : "Создать сессию"}
       </button>
-
       <div className="divider">или</div>
-
       <div className="join-row">
         <input
           type="text"
@@ -272,15 +256,15 @@ function MediaControls({
         {camOn ? <IconVideo /> : <IconVideoOff />}
       </button>
 
+      {/* ctrl-btn-screen — скрывается на мобильных через CSS */}
       <button
-        className={`ctrl-btn ${isScreenSharing ? "ctrl-active" : ""}`}
+        className={`ctrl-btn ctrl-btn-screen ${isScreenSharing ? "ctrl-active" : ""}`}
         onClick={isScreenSharing ? onStopScreen : onStartScreen}
         title={isScreenSharing ? "Остановить демонстрацию" : "Демонстрация экрана"}
       >
         {isScreenSharing ? <IconScreenShareActive /> : <IconScreenShare />}
       </button>
 
-      {/* Скрыть/показать своё видео (не отключает камеру для собеседника) */}
       <button
         className={`ctrl-btn ${pipVisible ? "" : "ctrl-off"}`}
         onClick={onTogglePip}
@@ -334,9 +318,6 @@ function Call({
     }
   };
 
-  /* Плейсхолдер показываем только когда нет remote stream */
-  const showPlaceholder = !remoteStream;
-
   return (
     <div className="call">
       {remoteStream ? (
@@ -351,7 +332,6 @@ function Call({
         <ResizablePip stream={localStream} visible={pipVisible} />
       )}
 
-      {/* Единственный статус-оверлей: показывается всегда когда есть текст */}
       {statusMsg && (
         <div className={`status-overlay status-${status}`}>{statusMsg}</div>
       )}
@@ -434,14 +414,7 @@ export default function App() {
   }
 
   if (!sessionKey) {
-    return (
-      <Lobby
-        onJoin={handleJoin}
-        initialKey={urlSessionKey}
-        theme={theme}
-        onToggleTheme={toggleTheme}
-      />
-    );
+    return <Lobby onJoin={handleJoin} initialKey={urlSessionKey} theme={theme} onToggleTheme={toggleTheme} />;
   }
 
   return (
