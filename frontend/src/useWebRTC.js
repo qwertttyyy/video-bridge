@@ -1,28 +1,30 @@
-// frontend/src/useWebRTC.js
 import { useRef, useState, useCallback, useEffect } from "react";
 
 /**
- * WebRTC с «Perfect Negotiation» паттерном.
+ * WebRTC с «Perfect Negotiation» и оптимизацией задержки.
  *
- * Ключевые улучшения:
- * — Perfect Negotiation: caller = impolite, callee = polite → нет коллизий offer/offer
- * — negotiationneeded обрабатывается автоматически (screen share, addTrack)
- * — Камера хранится отдельно от «отображаемого» стрима
- * — Remote stream пересоздаётся при реконнекте (не копит старые треки)
- * — Таймаут на подключение
- * — ICE restart с корректным сбросом очереди
+ * — Caller: addTrack → negotiationneeded → offer (автоматически)
+ * — Callee: первый offer обрабатывается явно (negotiationneeded подавляется)
+ * — Ренегоциация (screen share, ICE restart): negotiationneeded штатно
+ * — Latency: iceCandidatePoolSize, codec preferences, jitterBufferTarget
  */
 
+// ── Настраиваемые константы ──────────────────────────────────────────
 const ICE_RESTART_DELAY = 2500;
-const CONNECTION_TIMEOUT = 15000; // 15 секунд на установку соединения
+const CONNECTION_TIMEOUT = 8000;    // Таймаут на установку соединения (мс)
+const CANDIDATE_POOL_SIZE = 4;      // Пре-сбор ICE-кандидатов
+const JITTER_BUFFER_MS = 50;        // Целевой jitter buffer (мс)
+const MAX_VIDEO_BITRATE = 2_500_000; // Макс. битрейт видео (bps)
+// ─────────────────────────────────────────────────────────────────────
 
 export function useWebRTC({ send, setOnMessage }) {
   const pcRef = useRef(null);
-  const cameraStreamRef = useRef(null);     // Оригинальный стрим камеры (не меняется)
+  const cameraStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
-  const roleRef = useRef(null);             // "caller" | "callee"
-  const makingOfferRef = useRef(false);     // Флаг: мы сейчас создаём offer
-  const ignoreOfferRef = useRef(false);     // Флаг: игнорировать входящий offer (impolite peer)
+  const roleRef = useRef(null);
+  const makingOfferRef = useRef(false);
+  const ignoreOfferRef = useRef(false);
+  const suppressNegotiationRef = useRef(false);
   const restartTimerRef = useRef(null);
   const connectionTimerRef = useRef(null);
   const iceConfigRef = useRef(null);
@@ -33,10 +35,9 @@ export function useWebRTC({ send, setOnMessage }) {
   const [error, setError] = useState(null);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
 
-  /** Polite peer уступает при коллизии, impolite — нет */
   const isPolite = useCallback(() => roleRef.current === "callee", []);
 
-  /* ── Загрузка ICE конфигурации ── */
+  /* ── ICE конфигурация ── */
 
   const getIceConfig = useCallback(async () => {
     if (iceConfigRef.current) return iceConfigRef.current;
@@ -48,52 +49,93 @@ export function useWebRTC({ send, setOnMessage }) {
 
   /* ── Таймаут подключения ── */
 
-  const startConnectionTimeout = useCallback(() => {
-    clearTimeout(connectionTimerRef.current);
-    connectionTimerRef.current = setTimeout(() => {
-      const pc = pcRef.current;
-      if (!pc) return;
-      const state = pc.iceConnectionState;
-      if (state !== "connected" && state !== "completed") {
-        console.warn("[WebRTC] Таймаут подключения, пробую ICE restart");
-        scheduleIceRestart();
-      }
-    }, CONNECTION_TIMEOUT);
-  }, []);
-
   const clearConnectionTimeout = useCallback(() => {
     clearTimeout(connectionTimerRef.current);
     connectionTimerRef.current = null;
   }, []);
 
+  const scheduleIceRestartRef = useRef(null);
+
+  const startConnectionTimeout = useCallback(() => {
+    clearConnectionTimeout();
+    connectionTimerRef.current = setTimeout(() => {
+      const pc = pcRef.current;
+      if (!pc) return;
+      const s = pc.iceConnectionState;
+      if (s !== "connected" && s !== "completed") {
+        console.warn(`[WebRTC] Таймаут ${CONNECTION_TIMEOUT}мс — ICE restart`);
+        scheduleIceRestartRef.current?.();
+      }
+    }, CONNECTION_TIMEOUT);
+  }, [clearConnectionTimeout]);
+
   /* ── Медиа ── */
 
   const acquireMedia = useCallback(async () => {
     if (cameraStreamRef.current) return cameraStreamRef.current;
-    console.log("[WebRTC] Запрашиваю getUserMedia...");
+    console.log("[WebRTC] getUserMedia...");
     try {
       let stream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         });
       } catch {
-        // Фоллбэк на базовые constraints
         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       }
-      console.log("[WebRTC] getUserMedia OK, треки:",
-        stream.getTracks().map(t => `${t.kind}=${t.readyState}`).join(", "));
+      console.log("[WebRTC] getUserMedia OK:", stream.getTracks().map(t => t.kind).join(", "));
       cameraStreamRef.current = stream;
       setLocalStream(stream);
       return stream;
     } catch (err) {
       console.error("[WebRTC] getUserMedia FAIL:", err.name, err.message);
       throw err;
+    }
+  }, []);
+
+  /* ── Оптимизация задержки ── */
+
+  const preferLowLatencyCodecs = useCallback((pc) => {
+    if (!pc.getTransceivers) return;
+    for (const tr of pc.getTransceivers()) {
+      if (tr.receiver.track?.kind !== "video") continue;
+      if (!tr.setCodecPreferences) continue;
+      try {
+        const codecs = RTCRtpReceiver.getCapabilities("video")?.codecs || [];
+        const sorted = [
+          ...codecs.filter(c => c.mimeType === "video/VP8"),
+          ...codecs.filter(c => c.mimeType === "video/H264"),
+          ...codecs.filter(c => c.mimeType !== "video/VP8" && c.mimeType !== "video/H264"),
+        ];
+        tr.setCodecPreferences(sorted);
+      } catch { /* не все браузеры поддерживают */ }
+    }
+  }, []);
+
+  const tuneReceiverLatency = useCallback((pc) => {
+    for (const r of pc.getReceivers()) {
+      if (typeof r.jitterBufferTarget !== "undefined") {
+        r.jitterBufferTarget = JITTER_BUFFER_MS / 1000;
+      }
+      if (typeof r.playoutDelayHint !== "undefined") {
+        r.playoutDelayHint = 0;
+      }
+    }
+  }, []);
+
+  const tuneSenderParams = useCallback(async (pc) => {
+    for (const sender of pc.getSenders()) {
+      if (!sender.track) continue;
+      const params = sender.getParameters();
+      if (!params.encodings?.length) continue;
+      for (const enc of params.encodings) {
+        if (sender.track.kind === "video") {
+          enc.maxBitrate = MAX_VIDEO_BITRATE;
+          enc.degradationPreference = "maintain-framerate";
+        }
+      }
+      try { await sender.setParameters(params); } catch { /* ok */ }
     }
   }, []);
 
@@ -111,7 +153,6 @@ export function useWebRTC({ send, setOnMessage }) {
       restartTimerRef.current = null;
       const currentPc = pcRef.current;
       if (!currentPc || currentPc.signalingState === "closed") return;
-
       try {
         const offer = await currentPc.createOffer({ iceRestart: true });
         if (currentPc.signalingState === "closed") return;
@@ -124,81 +165,73 @@ export function useWebRTC({ send, setOnMessage }) {
     }, ICE_RESTART_DELAY);
   }, [send, startConnectionTimeout]);
 
+  scheduleIceRestartRef.current = scheduleIceRestart;
+
   /* ── PeerConnection ── */
 
   const closePc = useCallback(() => {
     clearTimeout(restartTimerRef.current);
     restartTimerRef.current = null;
     clearConnectionTimeout();
-
     screenStreamRef.current?.getTracks().forEach(t => t.stop());
     screenStreamRef.current = null;
     setIsScreenSharing(false);
-
     makingOfferRef.current = false;
     ignoreOfferRef.current = false;
-
+    suppressNegotiationRef.current = false;
     pcRef.current?.close();
     pcRef.current = null;
   }, [clearConnectionTimeout]);
 
   const createPC = useCallback(async () => {
     closePc();
-
     const config = await getIceConfig();
-    const pc = new RTCPeerConnection({ iceServers: config.iceServers });
+
+    const pc = new RTCPeerConnection({
+      iceServers: config.iceServers,
+      iceCandidatePoolSize: CANDIDATE_POOL_SIZE,
+      bundlePolicy: "max-bundle",
+    });
     pcRef.current = pc;
 
-    // Свежий remote stream — не накапливает треки от предыдущих подключений
     const remote = new MediaStream();
     setRemoteStream(remote);
 
     pc.ontrack = (e) => {
       console.log("[WebRTC] ontrack:", e.track.kind, e.track.id);
-      // Удаляем старые треки того же kind, чтобы не дублировать
-      remote.getTracks()
-        .filter(t => t.kind === e.track.kind)
-        .forEach(t => remote.removeTrack(t));
+      remote.getTracks().filter(t => t.kind === e.track.kind).forEach(t => remote.removeTrack(t));
       remote.addTrack(e.track);
-
-      e.track.onended = () => {
-        remote.removeTrack(e.track);
-      };
+      e.track.onended = () => remote.removeTrack(e.track);
+      tuneReceiverLatency(pc);
     };
 
     pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        send({ type: "ice-candidate", candidate: e.candidate });
-      }
+      if (e.candidate) send({ type: "ice-candidate", candidate: e.candidate });
     };
 
     pc.oniceconnectionstatechange = () => {
       const s = pc.iceConnectionState;
       console.log("[WebRTC] ICE state:", s);
-
       if (s === "connected" || s === "completed") {
         clearTimeout(restartTimerRef.current);
         restartTimerRef.current = null;
         clearConnectionTimeout();
         setStatus("connected");
+        tuneSenderParams(pc);
+        tuneReceiverLatency(pc);
       }
-      if (s === "disconnected") {
-        // disconnected может быть временным — ждём перед restart
-        setStatus("reconnecting");
-        scheduleIceRestart();
-      }
-      if (s === "failed") {
+      if (s === "disconnected" || s === "failed") {
         setStatus("reconnecting");
         scheduleIceRestart();
       }
     };
 
-    /**
-     * Perfect Negotiation: negotiationneeded → создаём offer.
-     * Если мы polite и получили чужой offer во время создания своего →
-     * откатываемся и принимаем чужой (rollback).
-     */
+    // Perfect Negotiation: negotiationneeded
     pc.onnegotiationneeded = async () => {
+      if (suppressNegotiationRef.current) {
+        console.log("[WebRTC] negotiationneeded подавлен (setup callee)");
+        return;
+      }
       try {
         makingOfferRef.current = true;
         await pc.setLocalDescription();
@@ -212,91 +245,94 @@ export function useWebRTC({ send, setOnMessage }) {
     };
 
     return pc;
-  }, [send, closePc, getIceConfig, scheduleIceRestart, startConnectionTimeout, clearConnectionTimeout]);
+  }, [
+    send, closePc, getIceConfig, scheduleIceRestart,
+    startConnectionTimeout, clearConnectionTimeout,
+    tuneSenderParams, tuneReceiverLatency,
+  ]);
 
   /* ── Демонстрация экрана ── */
 
   const startScreenShare = useCallback(async () => {
     const pc = pcRef.current;
     if (!pc) return;
-
     try {
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true,
-      });
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       screenStreamRef.current = screenStream;
-
       const screenVideoTrack = screenStream.getVideoTracks()[0];
 
-      // Заменяем видеотрек через replaceTrack (без ренегоциации)
       const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
-      if (videoSender && screenVideoTrack) {
-        await videoSender.replaceTrack(screenVideoTrack);
-      }
+      if (videoSender && screenVideoTrack) await videoSender.replaceTrack(screenVideoTrack);
 
-      // Обновляем отображаемый стрим для PiP
       const displayStream = new MediaStream([
         screenVideoTrack,
         ...(cameraStreamRef.current?.getAudioTracks() || []),
       ]);
       setLocalStream(displayStream);
       setIsScreenSharing(true);
-
-      // Когда пользователь жмёт «Остановить» в браузере
-      screenVideoTrack.onended = () => {
-        doStopScreenShare();
-      };
-
+      screenVideoTrack.onended = () => doStopScreenShare();
       console.log("[WebRTC] Демонстрация экрана запущена");
     } catch (err) {
-      if (err.name !== "NotAllowedError") {
-        console.error("[WebRTC] getDisplayMedia FAIL:", err);
-      }
+      if (err.name !== "NotAllowedError") console.error("[WebRTC] getDisplayMedia FAIL:", err);
     }
   }, []);
 
   const doStopScreenShare = useCallback(async () => {
     const pc = pcRef.current;
-    const cameraStream = cameraStreamRef.current;
-
-    if (!pc || !cameraStream) return;
-
-    // Останавливаем треки экрана
+    const cam = cameraStreamRef.current;
+    if (!pc || !cam) return;
     screenStreamRef.current?.getTracks().forEach(t => t.stop());
     screenStreamRef.current = null;
-
-    // Возвращаем камеру
-    const cameraVideoTrack = cameraStream.getVideoTracks()[0];
-    if (cameraVideoTrack) {
+    const camVideo = cam.getVideoTracks()[0];
+    if (camVideo) {
       const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
-      if (videoSender) {
-        await videoSender.replaceTrack(cameraVideoTrack);
-      }
+      if (videoSender) await videoSender.replaceTrack(camVideo);
     }
-
-    setLocalStream(cameraStream);
+    setLocalStream(cam);
     setIsScreenSharing(false);
     console.log("[WebRTC] Демонстрация экрана остановлена");
   }, []);
 
-  /* ── Сигналинг: Perfect Negotiation ── */
+  /* ── Сигналинг: два явных сценария для первого подключения ── */
 
+  /** Caller: создаёт PC → addTrack → negotiationneeded → offer автоматически */
+  const initAsCallerAndOffer = useCallback(async () => {
+    setStatus("connecting");
+    const stream = await acquireMedia();
+    const pc = await createPC();
+    stream.getTracks().forEach(t => pc.addTrack(t, stream));
+    preferLowLatencyCodecs(pc);
+  }, [acquireMedia, createPC, preferLowLatencyCodecs]);
+
+  /** Callee: создаёт PC с подавленным negotiationneeded, явно answer-ит */
+  const initAsCalleeAndAnswer = useCallback(async (sdp) => {
+    setStatus("connecting");
+    const stream = await acquireMedia();
+
+    suppressNegotiationRef.current = true;
+    const pc = await createPC();
+    stream.getTracks().forEach(t => pc.addTrack(t, stream));
+    preferLowLatencyCodecs(pc);
+
+    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    send({ type: "answer", sdp: pc.localDescription });
+
+    suppressNegotiationRef.current = false;
+    startConnectionTimeout();
+  }, [acquireMedia, createPC, preferLowLatencyCodecs, send, startConnectionTimeout]);
+
+  /** Ренегоциация: PC уже есть — Perfect Negotiation */
   const handleOffer = useCallback(async (sdp) => {
     const pc = pcRef.current;
     if (!pc) return;
-
-    // Коллизия: мы тоже делаем offer прямо сейчас
     const offerCollision = makingOfferRef.current || pc.signalingState !== "stable";
-
-    // Impolite peer игнорирует чужой offer при коллизии
     ignoreOfferRef.current = !isPolite() && offerCollision;
     if (ignoreOfferRef.current) {
-      console.log("[WebRTC] Игнорирую встречный offer (impolite, коллизия)");
+      console.log("[WebRTC] Игнорирую offer (impolite, коллизия)");
       return;
     }
-
-    // Polite peer: rollback своего offer
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
@@ -309,8 +345,7 @@ export function useWebRTC({ send, setOnMessage }) {
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(sdp));
     } catch (err) {
-      // Может прийти answer на уже откаченный offer — не критично
-      console.warn("[WebRTC] setRemoteDescription(answer) error:", err.message);
+      console.warn("[WebRTC] setRemoteDescription(answer):", err.message);
     }
   }, []);
 
@@ -320,20 +355,11 @@ export function useWebRTC({ send, setOnMessage }) {
     try {
       await pc.addIceCandidate(new RTCIceCandidate(candidate));
     } catch (err) {
-      // Кандидат для устаревшего offer — игнорируем
       if (!ignoreOfferRef.current) {
-        console.warn("[WebRTC] addIceCandidate error:", err.message);
+        console.warn("[WebRTC] addIceCandidate:", err.message);
       }
     }
   }, []);
-
-  const initPeerConnection = useCallback(async () => {
-    setStatus("connecting");
-    const stream = await acquireMedia();
-    const pc = await createPC();
-    stream.getTracks().forEach(t => pc.addTrack(t, stream));
-    // negotiationneeded сработает автоматически → offer создастся сам
-  }, [acquireMedia, createPC]);
 
   const cleanup = useCallback(() => {
     closePc();
@@ -360,21 +386,18 @@ export function useWebRTC({ send, setOnMessage }) {
             break;
 
           case "peer_joined":
-            // Мы — caller, собеседник подключился → создаём PeerConnection
-            await initPeerConnection();
+            await initAsCallerAndOffer();
             break;
 
-          case "offer":
-            // Если PC ещё нет (мы callee, первый offer) → создаём
-            if (!pcRef.current || pcRef.current.signalingState === "closed") {
-              setStatus("connecting");
-              const stream = await acquireMedia();
-              const pc = await createPC();
-              stream.getTracks().forEach(t => pc.addTrack(t, stream));
-              // Не ждём negotiationneeded — сразу обрабатываем offer
+          case "offer": {
+            const pc = pcRef.current;
+            if (!pc || pc.signalingState === "closed") {
+              await initAsCalleeAndAnswer(data.sdp);
+            } else {
+              await handleOffer(data.sdp);
             }
-            await handleOffer(data.sdp);
             break;
+          }
 
           case "answer":
             await handleAnswer(data.sdp);
@@ -391,14 +414,13 @@ export function useWebRTC({ send, setOnMessage }) {
             break;
         }
       } catch (err) {
-        console.error("[WebRTC] Ошибка обработки сообщения:", err);
+        console.error("[WebRTC] Ошибка обработки:", err);
         setError(err.message);
       }
     };
-
     setOnMessage(processMessage);
   }, [
-    setOnMessage, acquireMedia, createPC, initPeerConnection,
+    setOnMessage, acquireMedia, initAsCallerAndOffer, initAsCalleeAndAnswer,
     handleOffer, handleAnswer, handleIceCandidate, closePc,
   ]);
 
