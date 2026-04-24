@@ -65,8 +65,10 @@ export function useSignaling() {
       }
 
       if (!intentionalClose.current && paramsRef.current) {
-        const delay = delayRef.current;
-        delayRef.current = Math.min(delay * 2, MAX_RECONNECT_DELAY);
+        const base = delayRef.current;
+        delayRef.current = Math.min(base * 2, MAX_RECONNECT_DELAY);
+        const jitter = 1 + (Math.random() * 0.6 - 0.3);
+        const delay = Math.floor(base * jitter);
         console.log(`[WS] Реконнект через ${delay}мс...`);
         reconnectTimer.current = setTimeout(() => {
           const p = paramsRef.current;

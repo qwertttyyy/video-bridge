@@ -1,3 +1,4 @@
+# backend/session_manager.py
 """Управление сессиями видеомоста в памяти с автоочисткой."""
 
 import asyncio
@@ -10,9 +11,9 @@ from fastapi import WebSocket
 
 logger = logging.getLogger("signaling")
 
-SESSION_TTL_EMPTY = 300  # Пустая сессия живёт 5 минут
-SESSION_TTL_INACTIVE = 3600  # Неактивная сессия — 1 час
-CLEANUP_INTERVAL = 60  # Проверка каждую минуту
+SESSION_TTL_EMPTY = 300
+SESSION_TTL_INACTIVE = 3600
+CLEANUP_INTERVAL = 60
 
 
 @dataclass
@@ -54,7 +55,6 @@ class SessionManager:
         return self.count >= self._max_sessions
 
     def start_cleanup_loop(self) -> None:
-        """Запускает фоновую задачу очистки. Вызывать при старте приложения."""
         if self._cleanup_task is None:
             self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
@@ -71,7 +71,6 @@ class SessionManager:
             del self._sessions[key]
 
     def create(self) -> str | None:
-        """Создаёт сессию. Возвращает ключ или None при лимите."""
         if self.limit_reached:
             return None
         key = uuid.uuid4().hex[:8]
@@ -79,7 +78,6 @@ class SessionManager:
         return key
 
     def ensure(self, key: str) -> bool:
-        """Гарантирует существование сессии. Возвращает False при лимите."""
         if key in self._sessions:
             self._sessions[key].touch()
             return True
@@ -96,7 +94,6 @@ class SessionManager:
         return session is not None and client_id in session.clients
 
     def is_full_for(self, key: str, client_id: str) -> bool:
-        """Сессия полна для данного клиента? Реконнект (тот же client_id) — ок."""
         session = self._sessions.get(key)
         if session is None:
             return True
@@ -105,25 +102,31 @@ class SessionManager:
         return session.is_full
 
     def add_client(self, key: str, client_id: str, ws: WebSocket) -> int:
-        """Добавляет клиента. Возвращает количество участников."""
         session = self._sessions[key]
         session.clients[client_id] = ws
         session.touch()
         return len(session.clients)
 
     def remove_client(self, key: str, client_id: str) -> None:
-        """Удаляет клиента. Пустая сессия остаётся (удалится по TTL)."""
         session = self._sessions.get(key)
         if session is None:
             return
         session.clients.pop(client_id, None)
         session.touch()
-        # Не удаляем сразу — даём время на реконнект
         if not session.clients:
             logger.info("Сессия %s пуста, будет удалена через %ds", key, SESSION_TTL_EMPTY)
 
+    def get_peer_id(self, key: str, client_id: str) -> str | None:
+        """Возвращает id собеседника, если он в сессии."""
+        session = self._sessions.get(key)
+        if session is None:
+            return None
+        for cid in session.clients:
+            if cid != client_id:
+                return cid
+        return None
+
     def get_peer_ws(self, key: str, client_id: str) -> WebSocket | None:
-        """Возвращает WebSocket собеседника."""
         session = self._sessions.get(key)
         if session is None:
             return None
@@ -131,3 +134,14 @@ class SessionManager:
             if cid != client_id:
                 return ws
         return None
+
+    def is_polite(self, key: str, client_id: str) -> bool | None:
+        """
+        Определяет polite-роль для Perfect Negotiation.
+        Polite = id меньше, чем у пира. Стабильно при реконнекте.
+        Возвращает None, если пира в сессии ещё нет.
+        """
+        peer_id = self.get_peer_id(key, client_id)
+        if peer_id is None:
+            return None
+        return client_id < peer_id

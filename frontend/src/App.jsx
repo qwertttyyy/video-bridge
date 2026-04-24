@@ -11,7 +11,14 @@ import {
 } from "./Icons";
 import "./App.css";
 
-const genClientId = () => crypto.randomUUID().slice(0, 8);
+const getClientId = () => {
+  let id = sessionStorage.getItem("vb-client-id");
+  if (!id) {
+    id = crypto.randomUUID().slice(0, 8);
+    sessionStorage.setItem("vb-client-id", id);
+  }
+  return id;
+};
 const buildInviteLink = (key) => `${window.location.origin}?session=${key}`;
 const getSessionFromUrl = () => new URLSearchParams(window.location.search).get("session");
 const copyToClipboard = async (text) => {
@@ -386,7 +393,7 @@ export default function App() {
       const url = new URL(window.location.href);
       url.searchParams.set("session", key);
       window.history.replaceState(null, "", url.toString());
-      signaling.connect(key, genClientId());
+      signaling.connect(key, getClientId());
     },
     [signaling],
   );
@@ -396,6 +403,7 @@ export default function App() {
     signaling.disconnect();
     setSessionKey(null);
     setIsCreator(false);
+    sessionStorage.removeItem("vb-client-id");
     const url = new URL(window.location.href);
     url.searchParams.delete("session");
     window.history.replaceState(null, "", url.pathname);
