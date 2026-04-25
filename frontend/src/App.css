@@ -508,8 +508,14 @@ body {
 .ctrl-btn.ctrl-off:hover { background: rgba(255, 69, 58, 0.25); }
 .ctrl-btn.ctrl-active { background: var(--success-subtle); color: var(--success); }
 .ctrl-btn.ctrl-active:hover { background: rgba(48, 209, 88, 0.25); }
-.ctrl-btn.ctrl-hangup { background: var(--danger); color: #fff; }
-.ctrl-btn.ctrl-hangup:hover { background: #ff6680; transform: scale(1.06); }
+.ctrl-btn.ctrl-hangup {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--danger);
+}
+.ctrl-btn.ctrl-hangup:hover {
+  background: rgba(255, 69, 58, 0.18);
+  transform: scale(1.06);
+}
 
 /* Screen share — скрыта на мобильных (не поддерживается iOS) */
 .ctrl-btn-screen { display: flex; }

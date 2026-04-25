@@ -78,21 +78,13 @@ export function IconHangUp(props) {
   return (
     <svg
       viewBox="0 0 24 24"
-      fill="none"
-      stroke="#ef4444"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
+      fill="currentColor"
       {...props}
     >
-      <path d="M2 12c0 3 2.5 6 10 6s10-3 10-6" />
-      <path d="M4 12v-2a2 2 0 012-2h1a1 1 0 011 1v3" />
-      <path d="M20 12v-2a2 2 0 00-2-2h-1a1 1 0 00-1 1v3" />
-      <line x1="3" y1="3" x2="21" y2="21" strokeWidth="2" />
+      <path d="M21.384 17.752a2.108 2.108 0 0 1-.522 3.359 11.583 11.583 0 0 1-5.103 1.114c-2.978 0-5.97-1.132-8.243-3.405-3.795-3.795-4.343-9.752-1.643-14.171a2.108 2.108 0 0 1 3.124-.572l2.39 1.953a2 2 0 0 1 .523 2.422l-.94 1.88a.5.5 0 0 0 .093.578l3.486 3.486a.5.5 0 0 0 .578.093l1.88-.94a2 2 0 0 1 2.422.523l1.955 2.391z" />
     </svg>
   );
 }
-
 export function IconVolumeHigh(props) {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
