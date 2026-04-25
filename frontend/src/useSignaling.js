@@ -1,17 +1,26 @@
 import { useRef, useCallback, useState } from "react";
 import { log } from "./logger";
+import {
+  RECONNECT_INITIAL_DELAY_MS,
+  RECONNECT_MAX_DELAY_MS,
+} from "./config";
 
-const MAX_RECONNECT_DELAY = 8000;
-const INITIAL_RECONNECT_DELAY = 500;
-
+/**
+ * WebSocket-сигналинг с автореконнектом, keepalive и backoff.
+ *
+ * Сервер шлёт ping каждые 20с → клиент отвечает pong.
+ * При обрыве — exponential backoff с джиттером.
+ * Race-fix: события onclose/onerror старого WS игнорируются,
+ * если в wsRef уже сидит новый.
+ */
 export function useSignaling() {
   const wsRef = useRef(null);
   const onMessageRef = useRef(null);
   const onDisconnectRef = useRef(null);
   const paramsRef = useRef(null);
-  const intentionalClose = useRef(false);
-  const reconnectTimer = useRef(null);
-  const delayRef = useRef(INITIAL_RECONNECT_DELAY);
+  const intentionalCloseRef = useRef(false);
+  const reconnectTimerRef = useRef(null);
+  const delayRef = useRef(RECONNECT_INITIAL_DELAY_MS);
 
   const [connected, setConnected] = useState(false);
 
@@ -26,81 +35,113 @@ export function useSignaling() {
     return false;
   }, []);
 
-  const doConnect = useCallback((sessionKey, clientId) => {
-    if (wsRef.current) {
-      intentionalClose.current = true;
-      wsRef.current.close();
-    }
-
-    intentionalClose.current = false;
-    paramsRef.current = { sessionKey, clientId };
-
-    const proto = window.location.protocol === "https:" ? "wss" : "ws";
-    const url = `${proto}://${window.location.host}/ws/${sessionKey}/${clientId}`;
-
-    log.ws("подключаюсь:", url);
-    const ws = new WebSocket(url);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      log.ws("open, clientId=", clientId);
-      setConnected(true);
-      delayRef.current = INITIAL_RECONNECT_DELAY;
-    };
-
-    ws.onclose = (e) => {
-      log.ws("close code=", e.code, "reason=", e.reason || "—");
-      setConnected(false);
-      wsRef.current = null;
-
-      if (e.code === 4001 || e.code === 4002) {
-        onDisconnectRef.current?.(e.code, e.reason);
-        return;
+  const doConnect = useCallback(
+    (sessionKey, clientId) => {
+      // Закрыть предыдущий, если был
+      const prev = wsRef.current;
+      if (prev) {
+        // Помечаем именно эту ссылку как "intentional close"
+        // через локальный флаг не получится — используем сравнение по ссылке ниже
+        prev.close();
       }
 
-      if (!intentionalClose.current && paramsRef.current) {
+      paramsRef.current = { sessionKey, clientId };
+      intentionalCloseRef.current = false;
+
+      const proto = window.location.protocol === "https:" ? "wss" : "ws";
+      const url = `${proto}://${window.location.host}/ws/${sessionKey}/${clientId}`;
+      log.ws("подключаюсь:", url);
+
+      const ws = new WebSocket(url);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (ws !== wsRef.current) return; // устаревшая ссылка
+        log.ws("open, clientId=", clientId);
+        setConnected(true);
+        delayRef.current = RECONNECT_INITIAL_DELAY_MS;
+      };
+
+      ws.onclose = (e) => {
+        // Race-fix: события старого WS игнорируем,
+        // если уже создан новый.
+        if (ws !== wsRef.current) {
+          log.ws("close (старая ссылка) — игнорирую");
+          return;
+        }
+        log.ws("close code=", e.code, "reason=", e.reason || "—");
+        setConnected(false);
+        wsRef.current = null;
+
+        // Серверный отказ — реконнект бесполезен
+        if (e.code === 4001 || e.code === 4002 || e.code === 4003) {
+          onDisconnectRef.current?.(e.code, e.reason);
+          return;
+        }
+
+        if (intentionalCloseRef.current || !paramsRef.current) return;
+
+        // Exponential backoff с джиттером ±30% (несинхронизированный реконнект)
         const base = delayRef.current;
-        delayRef.current = Math.min(base * 2, MAX_RECONNECT_DELAY);
+        delayRef.current = Math.min(base * 2, RECONNECT_MAX_DELAY_MS);
         const jitter = 1 + (Math.random() * 0.6 - 0.3);
         const delay = Math.floor(base * jitter);
         log.ws(`реконнект через ${delay}мс`);
-        reconnectTimer.current = setTimeout(() => {
+        reconnectTimerRef.current = setTimeout(() => {
           const p = paramsRef.current;
           if (p) doConnect(p.sessionKey, p.clientId);
         }, delay);
-      }
-    };
+      };
 
-    ws.onerror = (e) => log.warn("WS error", e);
+      ws.onerror = (e) => {
+        if (ws !== wsRef.current) return;
+        log.warn("WS error", e);
+      };
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.type === "ping") {
-        rawSend({ type: "pong" });
-        return;
-      }
-      onMessageRef.current?.(data);
-    };
-  }, [rawSend]);
+      ws.onmessage = (event) => {
+        if (ws !== wsRef.current) return;
+        const data = JSON.parse(event.data);
+        if (data.type === "ping") {
+          rawSend({ type: "pong" });
+          return;
+        }
+        onMessageRef.current?.(data);
+      };
+    },
+    [rawSend],
+  );
 
-  const connect = useCallback((sessionKey, clientId) => {
-    doConnect(sessionKey, clientId);
-  }, [doConnect]);
+  const connect = useCallback(
+    (sessionKey, clientId) => doConnect(sessionKey, clientId),
+    [doConnect],
+  );
 
-  const send = useCallback((data) => { rawSend(data); }, [rawSend]);
+  const send = useCallback((data) => rawSend(data), [rawSend]);
 
-  const setOnMessage = useCallback((h) => { onMessageRef.current = h; }, []);
-  const setOnDisconnect = useCallback((h) => { onDisconnectRef.current = h; }, []);
+  const setOnMessage = useCallback((handler) => {
+    onMessageRef.current = handler;
+  }, []);
+
+  const setOnDisconnect = useCallback((handler) => {
+    onDisconnectRef.current = handler;
+  }, []);
 
   const disconnect = useCallback(() => {
     log.ws("disconnect (intentional)");
-    intentionalClose.current = true;
+    intentionalCloseRef.current = true;
     paramsRef.current = null;
-    clearTimeout(reconnectTimer.current);
+    clearTimeout(reconnectTimerRef.current);
     wsRef.current?.close();
     wsRef.current = null;
     setConnected(false);
   }, []);
 
-  return { connect, send, setOnMessage, setOnDisconnect, disconnect, connected };
+  return {
+    connect,
+    send,
+    setOnMessage,
+    setOnDisconnect,
+    disconnect,
+    connected,
+  };
 }

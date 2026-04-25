@@ -1,4 +1,3 @@
-// frontend/public/sw.js
 const CACHE_NAME = "vbridge-v1";
 const STATIC_ASSETS = ["/", "/index.html"];
 

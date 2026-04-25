@@ -1,35 +1,75 @@
-// frontend/src/useWebRTC.js
 import { useRef, useState, useCallback, useEffect } from "react";
-import { log, describeCandidate, describeSdp, logSelectedPair } from "./logger";
 
-const CANDIDATE_POOL_SIZE = 4;
-const JITTER_BUFFER_MS = 50;
-const MAX_VIDEO_BITRATE = 2_500_000;
+import { log, describeCandidate, describeSdp } from "./logger";
+import {
+  ICE_DISCONNECTED_GRACE_MS,
+  PEER_DISCONNECTED_GRACE_MS,
+  ICE_RESTART_FAIL_TIMEOUT_MS,
+  PC_RECREATE_AFTER_FAILURES,
+  STATS_INTERVAL_MS,
+} from "./config";
+import { acquireMedia, stopStream, watchDeviceChanges } from "./lib/media";
+import {
+  createPeerConnection,
+  preferLowLatencyCodecs,
+  tuneReceiverLatency,
+  tuneSenderParams,
+} from "./lib/peerConnection";
+import {
+  startScreenShare as libStartScreenShare,
+  stopScreenShare as libStopScreenShare,
+} from "./lib/screenShare";
+import { getSelectedPair, qualityLevel } from "./lib/stats";
 
-const ICE_DISCONNECTED_GRACE_MS = 5000;
-const PEER_DISCONNECTED_GRACE_MS = 8000;
-const STATS_INTERVAL_MS = 15000;
-
+/**
+ * Главный WebRTC-хук. Оркестрирует:
+ *   — медиа (lib/media)
+ *   — PeerConnection (lib/peerConnection)
+ *   — Perfect Negotiation (offer/answer/candidate)
+ *   — ICE failure handling: restartIce → 2 провала подряд → пересоздание PC
+ *   — индикатор качества и обмен состоянием камеры/микрофона
+ */
 export function useWebRTC({ send, setOnMessage }) {
+  // ── PC и стримы ──
   const pcRef = useRef(null);
   const cameraStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
+
+  // ── Perfect Negotiation ──
   const politeRef = useRef(false);
   const makingOfferRef = useRef(false);
   const ignoreOfferRef = useRef(false);
   const suppressNegotiationRef = useRef(false);
+
+  // ── ICE / реконнект ──
   const iceConfigRef = useRef(null);
   const iceDisconnectTimerRef = useRef(null);
   const peerDisconnectTimerRef = useRef(null);
+  const restartGuardTimerRef = useRef(null);
+  const restartFailureCountRef = useRef(0);
+
+  // ── Misc ──
   const statsIntervalRef = useRef(null);
   const pendingCandidatesRef = useRef([]);
 
+  // ── Локальное media state (#15) ──
+  const localMediaStateRef = useRef({ camera: true, mic: true });
+
+  // ── React state ──
   const [localStream, setLocalStream] = useState(null);
   const [remoteStream, setRemoteStream] = useState(null);
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState(null);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [localMediaState, setLocalMediaStateState] = useState({ camera: true, mic: true });
+  const [remoteMediaState, setRemoteMediaState] = useState({ camera: true, mic: true });
+  const [connectionQuality, setConnectionQuality] = useState({
+    rtt: null,
+    level: "unknown",
+    relayed: false,
+  });
 
+  // ── Хелперы для таймеров ──
   const clearIceDisconnectTimer = () => {
     clearTimeout(iceDisconnectTimerRef.current);
     iceDisconnectTimerRef.current = null;
@@ -38,93 +78,90 @@ export function useWebRTC({ send, setOnMessage }) {
     clearTimeout(peerDisconnectTimerRef.current);
     peerDisconnectTimerRef.current = null;
   };
+  const clearRestartGuard = () => {
+    clearTimeout(restartGuardTimerRef.current);
+    restartGuardTimerRef.current = null;
+  };
   const clearStatsInterval = () => {
     clearInterval(statsIntervalRef.current);
     statsIntervalRef.current = null;
   };
 
-  /* ── ICE конфиг ── */
+  // ── ICE config ──
   const getIceConfig = useCallback(async () => {
     if (iceConfigRef.current) return iceConfigRef.current;
     log.ice("fetch /api/ice-config");
     const res = await fetch("/api/ice-config");
     const config = await res.json();
-    log.ice("iceServers:", config.iceServers.map(s => s.urls));
+    log.ice("iceServers:", config.iceServers.map((s) => s.urls));
     iceConfigRef.current = config;
     return config;
   }, []);
 
-  /* ── Медиа ── */
-  const acquireMedia = useCallback(async () => {
+  // ── Медиа ──
+  const acquireMediaCached = useCallback(async () => {
     if (cameraStreamRef.current) {
       log.media("acquireMedia: stream уже получен");
       return cameraStreamRef.current;
     }
-    log.media("getUserMedia начало");
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
-    } catch (err) {
-      log.warn("getUserMedia HD failed, пробую базовый:", err.name);
-      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    }
-    log.media("getUserMedia OK:", stream.getTracks().map(t => `${t.kind}:${t.label}`));
+    const stream = await acquireMedia();
+    log.media("getUserMedia OK:", stream.getTracks().map((t) => `${t.kind}:${t.label}`));
     cameraStreamRef.current = stream;
     setLocalStream(stream);
+
+    // Применить текущее media state к свежим трекам
+    const ms = localMediaStateRef.current;
+    stream.getVideoTracks().forEach((t) => (t.enabled = ms.camera));
+    stream.getAudioTracks().forEach((t) => (t.enabled = ms.mic));
+
     return stream;
   }, []);
 
-  /* ── Оптимизация задержки ── */
-  const preferLowLatencyCodecs = useCallback((pc) => {
-    if (!pc.getTransceivers) return;
-    for (const tr of pc.getTransceivers()) {
-      if (tr.receiver.track?.kind !== "video") continue;
-      if (!tr.setCodecPreferences) continue;
-      try {
-        const codecs = RTCRtpReceiver.getCapabilities("video")?.codecs || [];
-        const sorted = [
-          ...codecs.filter(c => c.mimeType === "video/VP8"),
-          ...codecs.filter(c => c.mimeType === "video/H264"),
-          ...codecs.filter(c => c.mimeType !== "video/VP8" && c.mimeType !== "video/H264"),
-        ];
-        tr.setCodecPreferences(sorted);
-      } catch { /* ok */ }
-    }
-  }, []);
+  // ── Отправка media-state пиру (#15) ──
+  const sendMediaStateToPeer = useCallback(
+    (state) => {
+      send({ type: "media-state", camera: state.camera, mic: state.mic });
+    },
+    [send],
+  );
 
-  const tuneReceiverLatency = useCallback((pc) => {
-    for (const r of pc.getReceivers()) {
-      if (typeof r.jitterBufferTarget !== "undefined") r.jitterBufferTarget = JITTER_BUFFER_MS / 1000;
-      if (typeof r.playoutDelayHint !== "undefined") r.playoutDelayHint = 0;
-    }
-  }, []);
+  // ── Управление локальной камерой/микрофоном (#15) ──
+  const updateLocalMediaState = useCallback(
+    (partial) => {
+      const next = { ...localMediaStateRef.current, ...partial };
+      localMediaStateRef.current = next;
+      setLocalMediaStateState(next);
 
-  const tuneSenderParams = useCallback(async (pc) => {
-    for (const sender of pc.getSenders()) {
-      if (!sender.track) continue;
-      const params = sender.getParameters();
-      if (!params.encodings?.length) continue;
-      for (const enc of params.encodings) {
-        if (sender.track.kind === "video") {
-          enc.maxBitrate = MAX_VIDEO_BITRATE;
-          enc.degradationPreference = "maintain-framerate";
-        }
+      const cam = cameraStreamRef.current;
+      if (cam) {
+        cam.getVideoTracks().forEach((t) => (t.enabled = next.camera));
+        cam.getAudioTracks().forEach((t) => (t.enabled = next.mic));
       }
-      try { await sender.setParameters(params); } catch { /* ok */ }
-    }
-  }, []);
 
-  /* ── Закрытие PC ── */
+      sendMediaStateToPeer(next);
+      log.media("local media state →", next);
+    },
+    [sendMediaStateToPeer],
+  );
+
+  const setLocalCameraEnabled = useCallback(
+    (enabled) => updateLocalMediaState({ camera: enabled }),
+    [updateLocalMediaState],
+  );
+  const setLocalMicEnabled = useCallback(
+    (enabled) => updateLocalMediaState({ mic: enabled }),
+    [updateLocalMediaState],
+  );
+
+  // ── Закрытие PC ──
   const closePc = useCallback(() => {
     if (pcRef.current) {
       log.pc("closePc: state был", pcRef.current.connectionState);
     }
     clearIceDisconnectTimer();
+    clearRestartGuard();
     clearStatsInterval();
-    screenStreamRef.current?.getTracks().forEach(t => t.stop());
+    stopStream(screenStreamRef.current);
     screenStreamRef.current = null;
     setIsScreenSharing(false);
     makingOfferRef.current = false;
@@ -133,19 +170,85 @@ export function useWebRTC({ send, setOnMessage }) {
     pendingCandidatesRef.current = [];
     pcRef.current?.close();
     pcRef.current = null;
+    setConnectionQuality({ rtt: null, level: "unknown", relayed: false });
   }, []);
 
-  /* ── Создание PC ── */
+  // ── Создание PC ──
+  // forwardRef для recreatePc — он использует initAsInitiatorAndOffer,
+  // который определяется ниже. Распутываем циклическую зависимость через ref.
+  const initAsInitiatorRef = useRef(null);
+
+  const recreatePc = useCallback(async () => {
+    log.pc("recreatePc: пересоздание PC после провалов restartIce");
+    closePc();
+    restartFailureCountRef.current = 0;
+    setStatus("reconnecting");
+    if (!politeRef.current) {
+      // impolite инициирует новый offer
+      await initAsInitiatorRef.current?.();
+    } else {
+      log.neg("polite: жду offer от impolite после recreatePc");
+      await acquireMediaCached();
+      setStatus("connecting");
+    }
+  }, [closePc, acquireMediaCached]);
+
+  const handleIceFailure = useCallback(
+    (pc) => {
+      // pc.restartIce() сам триггерит negotiationneeded → новый offer
+      log.ice("вызов restartIce()");
+      pc.restartIce();
+      clearRestartGuard();
+      restartGuardTimerRef.current = setTimeout(async () => {
+        if (pcRef.current !== pc) return;
+        const s = pc.iceConnectionState;
+        if (s === "connected" || s === "completed") {
+          restartFailureCountRef.current = 0;
+          return;
+        }
+        restartFailureCountRef.current += 1;
+        log.warn(
+          `restartIce не помог за ${ICE_RESTART_FAIL_TIMEOUT_MS}мс ` +
+            `(попытка ${restartFailureCountRef.current}/${PC_RECREATE_AFTER_FAILURES})`,
+        );
+        if (restartFailureCountRef.current >= PC_RECREATE_AFTER_FAILURES) {
+          await recreatePc();
+        } else {
+          handleIceFailure(pc);
+        }
+      }, ICE_RESTART_FAIL_TIMEOUT_MS);
+    },
+    [recreatePc],
+  );
+
+  const startStatsLoop = useCallback((pc) => {
+    clearStatsInterval();
+    statsIntervalRef.current = setInterval(async () => {
+      if (pcRef.current !== pc) return;
+      const pair = await getSelectedPair(pc);
+      if (!pair) return;
+      const level = qualityLevel(pair.rtt_ms);
+      setConnectionQuality({
+        rtt: pair.rtt_ms,
+        level,
+        relayed: pair.relayed,
+      });
+      log.stats("пара:", {
+        rtt: pair.rtt_ms,
+        level,
+        relayed: pair.relayed,
+        local: pair.local && `${pair.local.type}/${pair.local.protocol}`,
+        remote: pair.remote && `${pair.remote.type}/${pair.remote.protocol}`,
+      });
+    }, STATS_INTERVAL_MS);
+  }, []);
+
   const createPC = useCallback(async () => {
     closePc();
     const config = await getIceConfig();
 
     log.pc("new RTCPeerConnection, polite=", politeRef.current);
-    const pc = new RTCPeerConnection({
-      iceServers: config.iceServers,
-      iceCandidatePoolSize: CANDIDATE_POOL_SIZE,
-      bundlePolicy: "max-bundle",
-    });
+    const pc = createPeerConnection(config.iceServers);
     pcRef.current = pc;
 
     const remote = new MediaStream();
@@ -153,12 +256,9 @@ export function useWebRTC({ send, setOnMessage }) {
 
     pc.ontrack = (e) => {
       log.media("ontrack:", e.track.kind, "id=", e.track.id);
-      remote.getTracks().filter(t => t.kind === e.track.kind).forEach(t => remote.removeTrack(t));
+      remote.getTracks().filter((t) => t.kind === e.track.kind).forEach((t) => remote.removeTrack(t));
       remote.addTrack(e.track);
-      e.track.onended = () => {
-        log.media("remote track ended:", e.track.kind);
-        remote.removeTrack(e.track);
-      };
+      e.track.onended = () => remote.removeTrack(e.track);
       tuneReceiverLatency(pc);
     };
 
@@ -189,17 +289,14 @@ export function useWebRTC({ send, setOnMessage }) {
 
       if (s === "connected" || s === "completed") {
         clearIceDisconnectTimer();
+        clearRestartGuard();
+        restartFailureCountRef.current = 0;
         setStatus("connected");
         tuneSenderParams(pc);
         tuneReceiverLatency(pc);
-        // итоговая пара через 500мс (дать время nomination)
-        setTimeout(() => logSelectedPair(pc, "пара после connected"), 500);
-        // периодический мониторинг качества
-        clearStatsInterval();
-        statsIntervalRef.current = setInterval(
-          () => logSelectedPair(pc, "пара периодически"),
-          STATS_INTERVAL_MS,
-        );
+        startStatsLoop(pc);
+        // Сообщаем пиру наше актуальное media state
+        sendMediaStateToPeer(localMediaStateRef.current);
         return;
       }
 
@@ -208,17 +305,17 @@ export function useWebRTC({ send, setOnMessage }) {
         clearIceDisconnectTimer();
         iceDisconnectTimerRef.current = setTimeout(() => {
           if (pcRef.current === pc && pc.iceConnectionState === "disconnected") {
-            log.ice(`disconnected > ${ICE_DISCONNECTED_GRACE_MS}мс → restartIce()`);
-            pc.restartIce();
+            log.ice(`disconnected > ${ICE_DISCONNECTED_GRACE_MS}мс → restartIce`);
+            handleIceFailure(pc);
           }
         }, ICE_DISCONNECTED_GRACE_MS);
         return;
       }
 
       if (s === "failed") {
-        log.ice("failed → restartIce()");
+        log.ice("failed → restartIce");
         setStatus("reconnecting");
-        pc.restartIce();
+        handleIceFailure(pc);
       }
     };
 
@@ -241,130 +338,142 @@ export function useWebRTC({ send, setOnMessage }) {
     };
 
     return pc;
-  }, [send, closePc, getIceConfig, tuneSenderParams, tuneReceiverLatency]);
+  }, [
+    closePc, getIceConfig, send, handleIceFailure,
+    startStatsLoop, sendMediaStateToPeer,
+  ]);
 
-  /* ── Демонстрация экрана ── */
-  const startScreenShare = useCallback(async () => {
+  // ── Демонстрация экрана ──
+  const startScreenShareCmd = useCallback(async () => {
     const pc = pcRef.current;
     if (!pc) return;
     try {
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      const { screenStream, displayStream, screenVideoTrack } =
+        await libStartScreenShare(pc, cameraStreamRef.current);
       screenStreamRef.current = screenStream;
-      const screenVideoTrack = screenStream.getVideoTracks()[0];
-
-      const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
-      if (videoSender && screenVideoTrack) await videoSender.replaceTrack(screenVideoTrack);
-
-      const displayStream = new MediaStream([
-        screenVideoTrack,
-        ...(cameraStreamRef.current?.getAudioTracks() || []),
-      ]);
       setLocalStream(displayStream);
       setIsScreenSharing(true);
-      screenVideoTrack.onended = () => doStopScreenShare();
-      log.media("демонстрация экрана запущена");
+      screenVideoTrack.onended = () => stopScreenShareCmd();
     } catch (err) {
       if (err.name !== "NotAllowedError") log.err("getDisplayMedia FAIL:", err);
     }
   }, []);
 
-  const doStopScreenShare = useCallback(async () => {
+  const stopScreenShareCmd = useCallback(async () => {
     const pc = pcRef.current;
     const cam = cameraStreamRef.current;
     if (!pc || !cam) return;
-    screenStreamRef.current?.getTracks().forEach(t => t.stop());
+    await libStopScreenShare(pc, cam, screenStreamRef.current);
     screenStreamRef.current = null;
-    const camVideo = cam.getVideoTracks()[0];
-    if (camVideo) {
-      const videoSender = pc.getSenders().find(s => s.track?.kind === "video");
-      if (videoSender) await videoSender.replaceTrack(camVideo);
-    }
     setLocalStream(cam);
     setIsScreenSharing(false);
-    log.media("демонстрация экрана остановлена");
   }, []);
 
-  /* ── Инициатор offer ── */
+  // ── Начальные сетапы ──
   const initAsInitiatorAndOffer = useCallback(async () => {
     log.neg("initAsInitiator: добавляю треки → negotiationneeded сам отправит offer");
     setStatus("connecting");
-    const stream = await acquireMedia();
+    const stream = await acquireMediaCached();
     const pc = await createPC();
-    stream.getTracks().forEach(t => pc.addTrack(t, stream));
+    stream.getTracks().forEach((t) => pc.addTrack(t, stream));
     preferLowLatencyCodecs(pc);
-  }, [acquireMedia, createPC, preferLowLatencyCodecs]);
+  }, [acquireMediaCached, createPC]);
 
-  /* ── Получатель первого offer ── */
-  const initAsReceiverAndAnswer = useCallback(async (sdp) => {
-    log.neg("initAsReceiver: создаю PC и отвечаю answer");
-    setStatus("connecting");
-    const stream = await acquireMedia();
+  // Сохраняем в ref для использования в recreatePc
+  initAsInitiatorRef.current = initAsInitiatorAndOffer;
 
-    suppressNegotiationRef.current = true;
-    const pc = await createPC();
-    stream.getTracks().forEach(t => pc.addTrack(t, stream));
-    preferLowLatencyCodecs(pc);
-
-    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    log.neg("remoteDescription установлен:", describeSdp(sdp));
-    await pc.setLocalDescription();
-    log.neg("→ отправляю answer:", describeSdp(pc.localDescription));
-    send({ type: "answer", sdp: pc.localDescription });
-
-    suppressNegotiationRef.current = false;
-
-    // применяем буферизованные ICE-кандидаты
-    if (pendingCandidatesRef.current.length) {
-      log.ice("применяю", pendingCandidatesRef.current.length, "буферизованных кандидатов");
-      for (const c of pendingCandidatesRef.current) {
-        try { await pc.addIceCandidate(c); } catch (err) { log.warn("addIceCandidate (buffered):", err.message); }
-      }
-      pendingCandidatesRef.current = [];
-    }
-  }, [acquireMedia, createPC, preferLowLatencyCodecs, send]);
-
-  /* ── Центральный обработчик «пир готов к звонку» ──
-     Вызывается из обоих событий: и из role (для второго клиента),
-     и из peer_joined (для первого клиента). Так исключается
-     ситуация, когда никто не инициирует offer. */
-  const onPeerReady = useCallback(async (polite) => {
-    politeRef.current = polite;
-    clearPeerDisconnectTimer();
-    log.neg(`onPeerReady: polite=${polite}, роль=${polite ? "polite (ждёт)" : "impolite (инициатор)"}`);
-
-    const pc = pcRef.current;
-    if (pc && pc.connectionState !== "closed" && pc.connectionState !== "failed") {
-      log.neg(`PC жив (state=${pc.connectionState}) — начальную инициацию пропускаю`);
-      if (!polite &&
-          (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed")) {
-        log.neg("impolite + ICE не в порядке → restartIce");
-        pc.restartIce();
-      }
-      return;
-    }
-
-    await acquireMedia();
-    if (!polite) {
-      await initAsInitiatorAndOffer();
-    } else {
+  const initAsReceiverAndAnswer = useCallback(
+    async (sdp) => {
+      log.neg("initAsReceiver: создаю PC и отвечаю answer");
       setStatus("connecting");
-      log.neg("polite: жду offer от impolite");
-    }
-  }, [acquireMedia, initAsInitiatorAndOffer]);
+      const stream = await acquireMediaCached();
 
-  /* ── Обработка offer/answer/candidate ── */
-  const handleOffer = useCallback(async (sdp) => {
-    const pc = pcRef.current;
-    if (!pc) return;
-    const offerCollision = makingOfferRef.current || pc.signalingState !== "stable";
-    ignoreOfferRef.current = !politeRef.current && offerCollision;
-    log.neg("handleOffer: collision=", offerCollision, "ignore=", ignoreOfferRef.current);
-    if (ignoreOfferRef.current) return;
-    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-    await pc.setLocalDescription();
-    log.neg("→ отправляю answer:", describeSdp(pc.localDescription));
-    send({ type: "answer", sdp: pc.localDescription });
-  }, [send]);
+      suppressNegotiationRef.current = true;
+      const pc = await createPC();
+      stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+      preferLowLatencyCodecs(pc);
+
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      log.neg("remoteDescription установлен:", describeSdp(sdp));
+      await pc.setLocalDescription();
+      log.neg("→ отправляю answer:", describeSdp(pc.localDescription));
+      send({ type: "answer", sdp: pc.localDescription });
+
+      suppressNegotiationRef.current = false;
+
+      if (pendingCandidatesRef.current.length) {
+        log.ice("применяю", pendingCandidatesRef.current.length, "буферизованных кандидатов");
+        for (const c of pendingCandidatesRef.current) {
+          try {
+            await pc.addIceCandidate(c);
+          } catch (err) {
+            log.warn("addIceCandidate (buffered):", err.message);
+          }
+        }
+        pendingCandidatesRef.current = [];
+      }
+    },
+    [acquireMediaCached, createPC, send],
+  );
+
+  // ── onPeerReady (#10): различает живой/умерший PC ──
+  const onPeerReady = useCallback(
+    async (polite) => {
+      politeRef.current = polite;
+      clearPeerDisconnectTimer();
+      log.neg(
+        `onPeerReady: polite=${polite}, роль=${polite ? "polite (ждёт)" : "impolite (инициатор)"}`,
+      );
+
+      const pc = pcRef.current;
+      if (pc) {
+        const cs = pc.connectionState;
+        // PC жив и в норме — ничего не делаем, начальный сетап не нужен
+        if (cs === "connected" || cs === "connecting" || cs === "new") {
+          log.neg(`PC жив (state=${cs}) — пропускаю инициацию`);
+          if (
+            !polite &&
+            (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed")
+          ) {
+            log.neg("impolite + ICE проблема → restartIce");
+            handleIceFailure(pc);
+          }
+          return;
+        }
+        // PC мёртв (failed/closed/disconnected долго) — пересоздаём
+        if (cs === "failed" || cs === "closed" || cs === "disconnected") {
+          log.neg(`PC в состоянии ${cs} → пересоздаю`);
+          closePc();
+        }
+      }
+
+      await acquireMediaCached();
+      if (!polite) {
+        await initAsInitiatorAndOffer();
+      } else {
+        setStatus("connecting");
+        log.neg("polite: жду offer от impolite");
+      }
+    },
+    [acquireMediaCached, initAsInitiatorAndOffer, closePc, handleIceFailure],
+  );
+
+  // ── Обработчики SDP / ICE ──
+  const handleOffer = useCallback(
+    async (sdp) => {
+      const pc = pcRef.current;
+      if (!pc) return;
+      const offerCollision = makingOfferRef.current || pc.signalingState !== "stable";
+      ignoreOfferRef.current = !politeRef.current && offerCollision;
+      log.neg("handleOffer: collision=", offerCollision, "ignore=", ignoreOfferRef.current);
+      if (ignoreOfferRef.current) return;
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      await pc.setLocalDescription();
+      log.neg("→ отправляю answer:", describeSdp(pc.localDescription));
+      send({ type: "answer", sdp: pc.localDescription });
+    },
+    [send],
+  );
 
   const handleAnswer = useCallback(async (sdp) => {
     const pc = pcRef.current;
@@ -393,20 +502,24 @@ export function useWebRTC({ send, setOnMessage }) {
     }
   }, []);
 
+  // ── Cleanup ──
   const cleanup = useCallback(() => {
     log.pc("cleanup");
     clearPeerDisconnectTimer();
     closePc();
-    cameraStreamRef.current?.getTracks().forEach(t => t.stop());
+    stopStream(cameraStreamRef.current);
     cameraStreamRef.current = null;
     setLocalStream(null);
     setRemoteStream(null);
     setStatus("idle");
     setError(null);
     iceConfigRef.current = null;
+    setRemoteMediaState({ camera: true, mic: true });
+    setLocalMediaStateState({ camera: true, mic: true });
+    localMediaStateRef.current = { camera: true, mic: true };
   }, [closePc]);
 
-  /* ── Подписка на WS ── */
+  // ── Подписка на WS-сообщения ──
   useEffect(() => {
     const processMessage = async (data) => {
       try {
@@ -414,11 +527,9 @@ export function useWebRTC({ send, setOnMessage }) {
           case "role":
             log.ws("← role polite=", data.polite);
             if (typeof data.polite === "boolean") {
-              // Пир уже в комнате — оба могут начинать
               await onPeerReady(data.polite);
             } else {
-              // Пира ещё нет
-              await acquireMedia();
+              await acquireMediaCached();
               setStatus("waiting");
             }
             break;
@@ -450,13 +561,22 @@ export function useWebRTC({ send, setOnMessage }) {
             await handleIceCandidate(data.candidate);
             break;
 
+          case "media-state":
+            log.ws("← media-state", data);
+            setRemoteMediaState({
+              camera: !!data.camera,
+              mic: !!data.mic,
+            });
+            break;
+
           case "peer_disconnected":
             log.ws("← peer_disconnected, grace", PEER_DISCONNECTED_GRACE_MS, "мс");
             clearPeerDisconnectTimer();
             peerDisconnectTimerRef.current = setTimeout(() => {
-              log.pc("peer не вернулся, закрываю PC");
+              log.pc("peer не вернулся → закрываю PC");
               closePc();
               setRemoteStream(null);
+              setRemoteMediaState({ camera: true, mic: true });
               setStatus("disconnected");
             }, PEER_DISCONNECTED_GRACE_MS);
             setStatus("reconnecting");
@@ -469,14 +589,33 @@ export function useWebRTC({ send, setOnMessage }) {
     };
     setOnMessage(processMessage);
   }, [
-    setOnMessage, acquireMedia, onPeerReady, initAsReceiverAndAnswer,
+    setOnMessage, acquireMediaCached, onPeerReady, initAsReceiverAndAnswer,
     handleOffer, handleAnswer, handleIceCandidate, closePc,
   ]);
+
+  // ── devicechange listener (#13) ──
+  useEffect(() => {
+    const unwatch = watchDeviceChanges(() => {
+      // Пока только логируем. UI-нотификация пользователю — отдельная задача.
+    });
+    return unwatch;
+  }, []);
 
   useEffect(() => cleanup, [cleanup]);
 
   return {
-    localStream, remoteStream, status, error, cleanup,
-    isScreenSharing, startScreenShare, stopScreenShare: doStopScreenShare,
+    localStream,
+    remoteStream,
+    status,
+    error,
+    cleanup,
+    isScreenSharing,
+    startScreenShare: startScreenShareCmd,
+    stopScreenShare: stopScreenShareCmd,
+    localMediaState,
+    remoteMediaState,
+    setLocalCameraEnabled,
+    setLocalMicEnabled,
+    connectionQuality,
   };
 }

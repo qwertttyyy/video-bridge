@@ -1,4 +1,3 @@
-// frontend/src/Icons.jsx
 /**
  * Кастомные SVG-иконки в стиле SF Symbols.
  * Stroke-based, 24×24 viewBox, currentColor.
@@ -77,11 +76,18 @@ export function IconScreenShareActive(props) {
 
 export function IconHangUp(props) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" {...props}>
-      <path d="M2 12c0-3 2.5-6 10-6s10 3 10 6" />
-      <path d="M4 12v2a2 2 0 002 2h1a1 1 0 001-1v-3" />
-      <path d="M20 12v2a2 2 0 01-2 2h-1a1 1 0 01-1-1v-3" />
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="#ef4444"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      {...props}
+    >
+      <path d="M2 12c0 3 2.5 6 10 6s10-3 10-6" />
+      <path d="M4 12v-2a2 2 0 012-2h1a1 1 0 011 1v3" />
+      <path d="M20 12v-2a2 2 0 00-2-2h-1a1 1 0 00-1 1v3" />
       <line x1="3" y1="3" x2="21" y2="21" strokeWidth="2" />
     </svg>
   );

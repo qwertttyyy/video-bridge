@@ -1,7 +1,7 @@
-// frontend/src/App.jsx
 import { useState, useRef, useEffect, useCallback } from "react";
 import { useSignaling } from "./useSignaling";
 import { useWebRTC } from "./useWebRTC";
+import { QualityIndicator } from "./QualityIndicator";
 import {
   IconVideo, IconVideoOff, IconMic, IconMicOff,
   IconScreenShare, IconScreenShareActive, IconHangUp,
@@ -78,7 +78,6 @@ function ResizablePip({ stream, visible }) {
   const dragging = useRef(false);
   const startData = useRef(null);
 
-  /* Привязка стрима + aspect-ratio на .pip-video */
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
@@ -101,7 +100,6 @@ function ResizablePip({ stream, visible }) {
     };
   }, [stream]);
 
-  /* Ресайз за левый нижний угол */
   const onPointerDown = useCallback((e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -170,6 +168,10 @@ function Lobby({ onJoin, initialKey, theme, onToggleTheme }) {
     setErrorMsg(null);
     try {
       const res = await fetch("/api/sessions", { method: "POST" });
+      if (res.status === 429) {
+        setErrorMsg("Слишком много попыток. Попробуйте через минуту.");
+        return;
+      }
       const data = await res.json();
       if (data.error) { setErrorMsg(data.message); return; }
       await copyToClipboard(buildInviteLink(data.sessionKey));
@@ -218,38 +220,23 @@ function Lobby({ onJoin, initialKey, theme, onToggleTheme }) {
 }
 
 /* ── Панель управления ────────────────────────────────────────────── */
+/* camOn/micOn приходят из родителя (useWebRTC.localMediaState),
+   onCameraToggle/onMicToggle — сеттеры, которые меняют track.enabled
+   и шлют media-state пиру. */
 
 function MediaControls({
-  localStream, volume, onVolumeChange, onHangUp,
+  camOn, micOn, onCameraToggle, onMicToggle,
+  volume, onVolumeChange, onHangUp,
   isScreenSharing, onStartScreen, onStopScreen,
   pipVisible, onTogglePip,
 }) {
-  const [camOn, setCamOn] = useState(true);
-  const [micOn, setMicOn] = useState(true);
-
-  const toggleCam = () => {
-    if (!localStream) return;
-    const track = localStream.getVideoTracks()[0];
-    if (!track) return;
-    track.enabled = !track.enabled;
-    setCamOn(track.enabled);
-  };
-
-  const toggleMic = () => {
-    if (!localStream) return;
-    const track = localStream.getAudioTracks()[0];
-    if (!track) return;
-    track.enabled = !track.enabled;
-    setMicOn(track.enabled);
-  };
-
   const VolumeIcon = volume === 0 ? IconVolumeMute : volume < 0.5 ? IconVolumeLow : IconVolumeHigh;
 
   return (
     <div className="controls-bar">
       <button
         className={`ctrl-btn ${micOn ? "" : "ctrl-off"}`}
-        onClick={toggleMic}
+        onClick={() => onMicToggle(!micOn)}
         title={micOn ? "Выключить микрофон" : "Включить микрофон"}
       >
         {micOn ? <IconMic /> : <IconMicOff />}
@@ -257,13 +244,12 @@ function MediaControls({
 
       <button
         className={`ctrl-btn ${camOn ? "" : "ctrl-off"}`}
-        onClick={toggleCam}
+        onClick={() => onCameraToggle(!camOn)}
         title={camOn ? "Выключить камеру" : "Включить камеру"}
       >
         {camOn ? <IconVideo /> : <IconVideoOff />}
       </button>
 
-      {/* ctrl-btn-screen — скрывается на мобильных через CSS */}
       <button
         className={`ctrl-btn ctrl-btn-screen ${isScreenSharing ? "ctrl-active" : ""}`}
         onClick={isScreenSharing ? onStopScreen : onStartScreen}
@@ -311,6 +297,9 @@ function Call({
   sessionKey, localStream, remoteStream, status, onHangUp,
   isScreenSharing, onStartScreen, onStopScreen,
   theme, onToggleTheme,
+  localMediaState, remoteMediaState,
+  onCameraToggle, onMicToggle,
+  connectionQuality,
 }) {
   const [peerVolume, setPeerVolume] = useState(1);
   const [copied, setCopied] = useState(false);
@@ -325,14 +314,24 @@ function Call({
     }
   };
 
+  // Камера пира выключена → placeholder вместо последнего кадра
+  const showRemotePlaceholder =
+    !remoteStream || !remoteMediaState?.camera;
+
   return (
     <div className="call">
-      {remoteStream ? (
-        <Video stream={remoteStream} volume={peerVolume} className="remote-video" />
-      ) : (
+      {showRemotePlaceholder ? (
         <div className="remote-video remote-placeholder">
           <IconUser />
         </div>
+      ) : (
+        <Video stream={remoteStream} volume={peerVolume} className="remote-video" />
+      )}
+
+      {/* Аудио идёт всегда (если remoteStream есть), даже когда показан placeholder.
+          Скрытый <audio> играет remote-стрим вне зависимости от <video>. */}
+      {showRemotePlaceholder && remoteStream && (
+        <RemoteAudio stream={remoteStream} volume={peerVolume} />
       )}
 
       {localStream && (
@@ -349,6 +348,13 @@ function Call({
           <button className="top-action-btn" onClick={handleCopyLink}>
             {copied ? <><IconCheck /> Скопировано</> : <><IconLink /> Ссылка</>}
           </button>
+          {connectionQuality && status === "connected" && (
+            <QualityIndicator
+              rtt={connectionQuality.rtt}
+              level={connectionQuality.level}
+              relayed={connectionQuality.relayed}
+            />
+          )}
         </div>
         <div className="top-bar-right">
           <button className="theme-toggle-call" onClick={onToggleTheme} title="Сменить тему">
@@ -358,7 +364,10 @@ function Call({
       </div>
 
       <MediaControls
-        localStream={localStream}
+        camOn={localMediaState?.camera ?? true}
+        micOn={localMediaState?.mic ?? true}
+        onCameraToggle={onCameraToggle}
+        onMicToggle={onMicToggle}
         volume={peerVolume}
         onVolumeChange={setPeerVolume}
         onHangUp={onHangUp}
@@ -372,16 +381,36 @@ function Call({
   );
 }
 
+/* Скрытый аудио-элемент: проигрывает remote audio,
+   когда основной <video> не отрендерен (камера пира выключена). */
+function RemoteAudio({ stream, volume }) {
+  const audioRef = useRef(null);
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el || !stream) return;
+    if (el.srcObject !== stream) el.srcObject = stream;
+    el.play().catch(() => {});
+    return () => { el.srcObject = null; };
+  }, [stream]);
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.volume = volume;
+  }, [volume]);
+  return <audio ref={audioRef} autoPlay style={{ display: "none" }} />;
+}
+
 /* ── Корневой компонент ───────────────────────────────────────────── */
 
 export default function App() {
   const [sessionKey, setSessionKey] = useState(null);
-  const [isCreator, setIsCreator] = useState(false);
+  const [, setIsCreator] = useState(false);
   const { theme, toggle: toggleTheme } = useTheme();
   const signaling = useSignaling();
   const {
     localStream, remoteStream, status, error, cleanup,
     isScreenSharing, startScreenShare, stopScreenShare,
+    localMediaState, remoteMediaState,
+    setLocalCameraEnabled, setLocalMicEnabled,
+    connectionQuality,
   } = useWebRTC(signaling);
 
   const urlSessionKey = getSessionFromUrl();
@@ -432,12 +461,16 @@ export default function App() {
       remoteStream={remoteStream}
       status={status}
       onHangUp={handleHangUp}
-      isCreator={isCreator}
       isScreenSharing={isScreenSharing}
       onStartScreen={startScreenShare}
       onStopScreen={stopScreenShare}
       theme={theme}
       onToggleTheme={toggleTheme}
+      localMediaState={localMediaState}
+      remoteMediaState={remoteMediaState}
+      onCameraToggle={setLocalCameraEnabled}
+      onMicToggle={setLocalMicEnabled}
+      connectionQuality={connectionQuality}
     />
   );
 }

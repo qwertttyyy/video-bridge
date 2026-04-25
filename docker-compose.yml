@@ -30,9 +30,10 @@ services:
           --external-ip=${SERVER_IP} \
           --min-port=49152 \
           --max-port=49252 \
-          --realm=${SERVER_DOMAIN} \
-          --user=${TURN_USERNAME}:${TURN_PASSWORD} \
-          --lt-cred-mech \
+          --use-auth-secret \
+          --static-auth-secret=${TURN_SECRET} \
+          --realm=${TURN_REALM} \
+          --no-multicast-peers \
           --fingerprint \
           --no-tls \
           --no-dtls \
