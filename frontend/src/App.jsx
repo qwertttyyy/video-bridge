@@ -428,6 +428,7 @@ export default function App() {
   );
 
   const handleHangUp = useCallback(() => {
+    signaling.send({ type: "hangup" });
     cleanup();
     signaling.disconnect();
     setSessionKey(null);

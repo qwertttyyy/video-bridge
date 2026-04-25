@@ -245,6 +245,8 @@ async def signaling(
         _keepalive(ws, session_key, client_id, lambda: last_pong)
     )
 
+    hangup_sent = False
+
     try:
         while True:
             raw = await ws.receive_json()
@@ -274,6 +276,15 @@ async def signaling(
                 last_pong = time.monotonic()
                 continue
 
+            if msg_type == "hangup":
+                # Явный hangup — пересылаем пиру peer_left и выходим из цикла.
+                logger.info("[%s] %s hangup", session_key, client_id)
+                peer_ws_local = sessions.get_peer_ws(session_key, client_id)
+                if peer_ws_local:
+                    await safe_send_json(peer_ws_local, {"type": "peer_left"})
+                hangup_sent = True
+                break
+
             logger.info("[%s] %s → %s", session_key, client_id, msg_type)
 
             # Пересылка пиру (без модификации payload)
@@ -295,7 +306,7 @@ async def signaling(
         logger.info("Сессий: %d/%d", sessions.count, sessions.max_sessions)
 
         peer_ws = sessions.get_peer_ws(session_key, client_id)
-        if peer_ws:
+        if peer_ws and not hangup_sent:
             await safe_send_json(peer_ws, {"type": "peer_disconnected"})
 
 

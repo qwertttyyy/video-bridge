@@ -7,6 +7,10 @@ import {
   ICE_RESTART_FAIL_TIMEOUT_MS,
   PC_RECREATE_AFTER_FAILURES,
   STATS_INTERVAL_MS,
+  HEARTBEAT_INTERVAL_MS,
+  HEARTBEAT_TIMEOUT_MS,
+  ICE_RESTART_WINDOW_MS,
+  ICE_RESTART_LIMIT_IN_WINDOW,
 } from "./config";
 import { acquireMedia, stopStream, watchDeviceChanges } from "./lib/media";
 import {
@@ -54,6 +58,15 @@ export function useWebRTC({ send, setOnMessage }) {
 
   // ── Локальное media state (#15) ──
   const localMediaStateRef = useRef({ camera: true, mic: true });
+
+  // ── Heartbeat по DataChannel (#4) ──
+  const hbChannelRef = useRef(null);
+  const hbSendTimerRef = useRef(null);
+  const hbWatchdogRef = useRef(null);
+  const lastHbPongRef = useRef(0);
+
+  // ── Окно ICE restart-ов (#5) ──
+  const restartHistoryRef = useRef([]);
 
   // ── React state ──
   const [localStream, setLocalStream] = useState(null);
@@ -158,6 +171,12 @@ export function useWebRTC({ send, setOnMessage }) {
     if (pcRef.current) {
       log.pc("closePc: state был", pcRef.current.connectionState);
     }
+    clearInterval(hbSendTimerRef.current);
+    clearInterval(hbWatchdogRef.current);
+    hbSendTimerRef.current = null;
+    hbWatchdogRef.current = null;
+    try { hbChannelRef.current?.close(); } catch { /* ok */ }
+    hbChannelRef.current = null;
     clearIceDisconnectTimer();
     clearRestartGuard();
     clearStatsInterval();
@@ -195,7 +214,22 @@ export function useWebRTC({ send, setOnMessage }) {
 
   const handleIceFailure = useCallback(
     (pc) => {
-      // pc.restartIce() сам триггерит negotiationneeded → новый offer
+      // если за окно уже было N рестартов — сразу recreatePc,
+      // не пытаемся ещё раз restartIce (защита от каскадных циклов).
+      const now = Date.now();
+      restartHistoryRef.current = restartHistoryRef.current.filter(
+        (t) => now - t < ICE_RESTART_WINDOW_MS,
+      );
+      if (restartHistoryRef.current.length >= ICE_RESTART_LIMIT_IN_WINDOW) {
+        log.warn(
+          `${ICE_RESTART_LIMIT_IN_WINDOW} рестартов за ${ICE_RESTART_WINDOW_MS}мс → recreatePc`,
+        );
+        restartHistoryRef.current = [];
+        recreatePc();
+        return;
+      }
+      restartHistoryRef.current.push(now);
+
       log.ice("вызов restartIce()");
       pc.restartIce();
       clearRestartGuard();
@@ -251,6 +285,67 @@ export function useWebRTC({ send, setOnMessage }) {
     const pc = createPeerConnection(config.iceServers);
     pcRef.current = pc;
 
+    const setupHeartbeat = (ch) => {
+      hbChannelRef.current = ch;
+      let restartAttempted = false;
+
+      ch.onopen = () => {
+        log.pc("heartbeat: канал открыт");
+        lastHbPongRef.current = Date.now();
+
+        hbSendTimerRef.current = setInterval(() => {
+          if (ch.readyState !== "open") return;
+          try { ch.send(JSON.stringify({ type: "ping" })); } catch { /* ok */ }
+        }, HEARTBEAT_INTERVAL_MS);
+
+        hbWatchdogRef.current = setInterval(() => {
+          const silence = Date.now() - lastHbPongRef.current;
+          if (silence < HEARTBEAT_TIMEOUT_MS) return;
+
+          if (pcRef.current !== pc) return;
+
+          if (!restartAttempted) {
+            log.warn(`heartbeat: тишина ${silence}мс → restartIce`);
+            restartAttempted = true;
+            handleIceFailure(pc);
+          } else {
+            log.warn(`heartbeat: ${silence}мс после restartIce → пир мёртв`);
+            clearInterval(hbWatchdogRef.current);
+            hbWatchdogRef.current = null;
+            closePc();
+            setRemoteStream(null);
+            setRemoteMediaState({ camera: true, mic: true });
+            setStatus("disconnected");
+          }
+        }, HEARTBEAT_INTERVAL_MS);
+      };
+
+      ch.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === "ping") {
+            try { ch.send(JSON.stringify({ type: "pong" })); } catch { /* ok */ }
+          } else if (msg.type === "pong") {
+            lastHbPongRef.current = Date.now();
+            restartAttempted = false;
+          }
+        } catch { /* ok */ }
+      };
+
+      ch.onclose = () => log.pc("heartbeat: канал закрыт");
+      ch.onerror = (e) => log.warn("heartbeat: канал error", e);
+    };
+
+    if (!politeRef.current) {
+      // impolite создаёт канал — он попадёт в первый offer
+      const ch = pc.createDataChannel("hb", { ordered: true });
+      setupHeartbeat(ch);
+    } else {
+      pc.ondatachannel = (e) => {
+        if (e.channel.label === "hb") setupHeartbeat(e.channel);
+      };
+    }
+
     const remote = new MediaStream();
     setRemoteStream(remote);
 
@@ -291,6 +386,7 @@ export function useWebRTC({ send, setOnMessage }) {
         clearIceDisconnectTimer();
         clearRestartGuard();
         restartFailureCountRef.current = 0;
+        restartHistoryRef.current = [];
         setStatus("connected");
         tuneSenderParams(pc);
         tuneReceiverLatency(pc);
@@ -569,8 +665,20 @@ export function useWebRTC({ send, setOnMessage }) {
             });
             break;
 
-          case "peer_disconnected":
-            log.ws("← peer_disconnected, grace", PEER_DISCONNECTED_GRACE_MS, "мс");
+          case "peer_disconnected": {
+            const pc = pcRef.current;
+            const alive =
+              pc &&
+              (pc.connectionState === "connected" || pc.connectionState === "connecting");
+
+            if (alive) {
+              log.ws(
+                `← peer_disconnected, но PC жив (${pc.connectionState}) — игнорирую`,
+              );
+              break;
+            }
+
+            log.ws("← peer_disconnected + PC мёртв, grace", PEER_DISCONNECTED_GRACE_MS, "мс");
             clearPeerDisconnectTimer();
             peerDisconnectTimerRef.current = setTimeout(() => {
               log.pc("peer не вернулся → закрываю PC");
@@ -580,6 +688,17 @@ export function useWebRTC({ send, setOnMessage }) {
               setStatus("disconnected");
             }, PEER_DISCONNECTED_GRACE_MS);
             setStatus("reconnecting");
+            break;
+          }
+
+          case "peer_left":
+            // Явное завершение звонка пиром — закрываем сразу, без grace.
+            log.ws("← peer_left (пир явно завершил звонок)");
+            clearPeerDisconnectTimer();
+            closePc();
+            setRemoteStream(null);
+            setRemoteMediaState({ camera: true, mic: true });
+            setStatus("disconnected");
             break;
         }
       } catch (err) {

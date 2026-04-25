@@ -30,9 +30,12 @@ class MediaStateMsg(BaseModel):
     camera: bool
     mic: bool
 
+class HangupMsg(BaseModel):
+    """Явное завершение звонка пользователем."""
+    type: Literal["hangup"]
 
 WsMessage = Annotated[
-    Union[OfferMsg, AnswerMsg, IceCandidateMsg, PongMsg, MediaStateMsg],
+    Union[OfferMsg, AnswerMsg, IceCandidateMsg, PongMsg, MediaStateMsg, HangupMsg],
     Field(discriminator="type"),
 ]
 
