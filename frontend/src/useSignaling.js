@@ -1,15 +1,9 @@
-// frontend/src/useSignaling.js
 import { useRef, useCallback, useState } from "react";
+import { log } from "./logger";
 
 const MAX_RECONNECT_DELAY = 8000;
 const INITIAL_RECONNECT_DELAY = 500;
 
-/**
- * WebSocket-сигналинг с автореконнектом и keepalive.
- *
- * Сервер шлёт ping каждые 20с → клиент отвечает pong.
- * При обрыве — exponential backoff реконнект.
- */
 export function useSignaling() {
   const wsRef = useRef(null);
   const onMessageRef = useRef(null);
@@ -25,13 +19,14 @@ export function useSignaling() {
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(data));
+      if (data.type !== "pong") log.ws("→", data.type);
       return true;
     }
+    log.warn("send пропущен, WS не OPEN:", data.type);
     return false;
   }, []);
 
   const doConnect = useCallback((sessionKey, clientId) => {
-    // Закрываем предыдущее соединение
     if (wsRef.current) {
       intentionalClose.current = true;
       wsRef.current.close();
@@ -43,22 +38,21 @@ export function useSignaling() {
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
     const url = `${proto}://${window.location.host}/ws/${sessionKey}/${clientId}`;
 
-    console.log("[WS] Подключаюсь:", url);
+    log.ws("подключаюсь:", url);
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
     ws.onopen = () => {
-      console.log("[WS] Соединение установлено");
+      log.ws("open, clientId=", clientId);
       setConnected(true);
       delayRef.current = INITIAL_RECONNECT_DELAY;
     };
 
     ws.onclose = (e) => {
-      console.log("[WS] Закрыто:", e.code, e.reason);
+      log.ws("close code=", e.code, "reason=", e.reason || "—");
       setConnected(false);
       wsRef.current = null;
 
-      // Код 4001/4002 — серверный отказ, реконнект бесполезен
       if (e.code === 4001 || e.code === 4002) {
         onDisconnectRef.current?.(e.code, e.reason);
         return;
@@ -69,7 +63,7 @@ export function useSignaling() {
         delayRef.current = Math.min(base * 2, MAX_RECONNECT_DELAY);
         const jitter = 1 + (Math.random() * 0.6 - 0.3);
         const delay = Math.floor(base * jitter);
-        console.log(`[WS] Реконнект через ${delay}мс...`);
+        log.ws(`реконнект через ${delay}мс`);
         reconnectTimer.current = setTimeout(() => {
           const p = paramsRef.current;
           if (p) doConnect(p.sessionKey, p.clientId);
@@ -77,17 +71,14 @@ export function useSignaling() {
       }
     };
 
-    ws.onerror = () => {};
+    ws.onerror = (e) => log.warn("WS error", e);
 
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
-
-      // Серверный keepalive ping → отвечаем pong
       if (data.type === "ping") {
         rawSend({ type: "pong" });
         return;
       }
-
       onMessageRef.current?.(data);
     };
   }, [rawSend]);
@@ -96,19 +87,13 @@ export function useSignaling() {
     doConnect(sessionKey, clientId);
   }, [doConnect]);
 
-  const send = useCallback((data) => {
-    rawSend(data);
-  }, [rawSend]);
+  const send = useCallback((data) => { rawSend(data); }, [rawSend]);
 
-  const setOnMessage = useCallback((handler) => {
-    onMessageRef.current = handler;
-  }, []);
-
-  const setOnDisconnect = useCallback((handler) => {
-    onDisconnectRef.current = handler;
-  }, []);
+  const setOnMessage = useCallback((h) => { onMessageRef.current = h; }, []);
+  const setOnDisconnect = useCallback((h) => { onDisconnectRef.current = h; }, []);
 
   const disconnect = useCallback(() => {
+    log.ws("disconnect (intentional)");
     intentionalClose.current = true;
     paramsRef.current = null;
     clearTimeout(reconnectTimer.current);
