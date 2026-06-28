@@ -3,6 +3,8 @@ import { log } from "./logger";
 import {
   RECONNECT_INITIAL_DELAY_MS,
   RECONNECT_MAX_DELAY_MS,
+  SIGNALING_QUEUE_MAX_MESSAGES,
+  SIGNALING_QUEUE_TTL_MS,
 } from "./config";
 
 /**
@@ -21,22 +23,79 @@ export function useSignaling() {
   const intentionalCloseRef = useRef(false);
   const reconnectTimerRef = useRef(null);
   const delayRef = useRef(RECONNECT_INITIAL_DELAY_MS);
+  const queuedMessagesRef = useRef([]);
 
   const [connected, setConnected] = useState(false);
+
+  const clearReconnectTimer = useCallback(() => {
+    clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
+  }, []);
+
+  const enqueueMessage = useCallback((data) => {
+    if (data.type === "pong") return;
+
+    if (data.type === "media-state") {
+      queuedMessagesRef.current = queuedMessagesRef.current.filter(
+        (item) => item.data.type !== "media-state",
+      );
+    }
+
+    queuedMessagesRef.current.push({ data, createdAt: Date.now() });
+    if (queuedMessagesRef.current.length > SIGNALING_QUEUE_MAX_MESSAGES) {
+      queuedMessagesRef.current.splice(
+        0,
+        queuedMessagesRef.current.length - SIGNALING_QUEUE_MAX_MESSAGES,
+      );
+    }
+  }, []);
+
+  const flushQueuedMessages = useCallback((ws) => {
+    if (ws.readyState !== WebSocket.OPEN || !queuedMessagesRef.current.length) return;
+
+    const now = Date.now();
+    const pending = queuedMessagesRef.current;
+    queuedMessagesRef.current = [];
+
+    for (const item of pending) {
+      if (now - item.createdAt > SIGNALING_QUEUE_TTL_MS) {
+        log.warn("queued signaling message expired:", item.data.type);
+        continue;
+      }
+      if (ws.readyState !== WebSocket.OPEN) {
+        queuedMessagesRef.current.push(item);
+        continue;
+      }
+      try {
+        ws.send(JSON.stringify(item.data));
+        log.ws("→ queued", item.data.type);
+      } catch {
+        queuedMessagesRef.current.push(item);
+      }
+    }
+  }, []);
 
   const rawSend = useCallback((data) => {
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(data));
-      if (data.type !== "pong") log.ws("→", data.type);
-      return true;
+      try {
+        ws.send(JSON.stringify(data));
+        if (data.type !== "pong") log.ws("→", data.type);
+        return true;
+      } catch {
+        enqueueMessage(data);
+        return false;
+      }
     }
-    log.warn("send пропущен, WS не OPEN:", data.type);
+    enqueueMessage(data);
+    log.warn("send поставлен в очередь, WS не OPEN:", data.type);
     return false;
-  }, []);
+  }, [enqueueMessage]);
 
   const doConnect = useCallback(
     (sessionKey, clientId) => {
+      clearReconnectTimer();
+
       // Закрыть предыдущий, если был
       const prev = wsRef.current;
       if (prev) {
@@ -60,6 +119,7 @@ export function useSignaling() {
         log.ws("open, clientId=", clientId);
         setConnected(true);
         delayRef.current = RECONNECT_INITIAL_DELAY_MS;
+        flushQueuedMessages(ws);
       };
 
       ws.onclose = (e) => {
@@ -75,6 +135,8 @@ export function useSignaling() {
 
         // Серверный отказ — реконнект бесполезен
         if (e.code === 4001 || e.code === 4002 || e.code === 4003) {
+          queuedMessagesRef.current = [];
+          paramsRef.current = null;
           onDisconnectRef.current?.(e.code, e.reason);
           return;
         }
@@ -100,7 +162,13 @@ export function useSignaling() {
 
       ws.onmessage = (event) => {
         if (ws !== wsRef.current) return;
-        const data = JSON.parse(event.data);
+        let data;
+        try {
+          data = JSON.parse(event.data);
+        } catch {
+          log.warn("WS message parse failed");
+          return;
+        }
         if (data.type === "ping") {
           rawSend({ type: "pong" });
           return;
@@ -108,7 +176,7 @@ export function useSignaling() {
         onMessageRef.current?.(data);
       };
     },
-    [rawSend],
+    [clearReconnectTimer, flushQueuedMessages, rawSend],
   );
 
   const connect = useCallback(
@@ -130,11 +198,12 @@ export function useSignaling() {
     log.ws("disconnect (intentional)");
     intentionalCloseRef.current = true;
     paramsRef.current = null;
-    clearTimeout(reconnectTimerRef.current);
+    queuedMessagesRef.current = [];
+    clearReconnectTimer();
     wsRef.current?.close();
     wsRef.current = null;
     setConnected(false);
-  }, []);
+  }, [clearReconnectTimer]);
 
   return {
     connect,

@@ -27,6 +27,10 @@ export function stopStream(stream) {
  * наушники, гарнитуру, веб-камеру). Возвращает функцию отписки.
  */
 export function watchDeviceChanges(onChange) {
+  if (!navigator.mediaDevices?.addEventListener) {
+    return () => {};
+  }
+
   const handler = async () => {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();

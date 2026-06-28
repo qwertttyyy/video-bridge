@@ -3,7 +3,15 @@
  * Каждый канал со своим цветом и префиксом — легко фильтровать в DevTools.
  */
 
-const DEBUG = true; // переключить на false в проде
+const DEBUG =
+  import.meta.env.DEV ||
+  (() => {
+    try {
+      return localStorage.getItem("vb-debug") === "1";
+    } catch {
+      return false;
+    }
+  })();
 
 const ts = () => {
   const d = new Date();

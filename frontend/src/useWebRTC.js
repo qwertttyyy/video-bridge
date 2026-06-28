@@ -11,6 +11,7 @@ import {
   HEARTBEAT_TIMEOUT_MS,
   ICE_RESTART_WINDOW_MS,
   ICE_RESTART_LIMIT_IN_WINDOW,
+  ICE_CONFIG_REFRESH_MARGIN_MS,
 } from "./config";
 import { acquireMedia, stopStream, watchDeviceChanges } from "./lib/media";
 import {
@@ -20,6 +21,7 @@ import {
   tuneSenderParams,
 } from "./lib/peerConnection";
 import {
+  disposeScreenShare,
   startScreenShare as libStartScreenShare,
   stopScreenShare as libStopScreenShare,
 } from "./lib/screenShare";
@@ -33,7 +35,7 @@ import { getSelectedPair, qualityLevel } from "./lib/stats";
  *   — ICE failure handling: restartIce → 2 провала подряд → пересоздание PC
  *   — индикатор качества и обмен состоянием камеры/микрофона
  */
-export function useWebRTC({ send, setOnMessage }) {
+export function useWebRTC({ send, setOnMessage, setOnDisconnect }) {
   // ── PC и стримы ──
   const pcRef = useRef(null);
   const cameraStreamRef = useRef(null);
@@ -101,15 +103,42 @@ export function useWebRTC({ send, setOnMessage }) {
   };
 
   // ── ICE config ──
-  const getIceConfig = useCallback(async () => {
-    if (iceConfigRef.current) return iceConfigRef.current;
+  const getIceConfig = useCallback(async ({ force = false } = {}) => {
+    const cached = iceConfigRef.current;
+    const now = Date.now();
+    if (
+      !force &&
+      cached?.config &&
+      cached.expiresAt > now + ICE_CONFIG_REFRESH_MARGIN_MS
+    ) {
+      return cached.config;
+    }
+
     log.ice("fetch /api/ice-config");
     const res = await fetch("/api/ice-config");
+    if (!res.ok) throw new Error(`ice-config HTTP ${res.status}`);
     const config = await res.json();
     log.ice("iceServers:", config.iceServers.map((s) => s.urls));
-    iceConfigRef.current = config;
+    const ttlMs = Math.max(0, Number(config.ttl || 0) * 1000);
+    iceConfigRef.current = {
+      config,
+      expiresAt: ttlMs ? now + ttlMs : 0,
+    };
     return config;
   }, []);
+
+  const refreshIceConfigForPc = useCallback(
+    async (pc) => {
+      const config = await getIceConfig();
+      if (pcRef.current !== pc || pc.connectionState === "closed") return;
+      try {
+        pc.setConfiguration({ iceServers: config.iceServers });
+      } catch (err) {
+        log.warn("setConfiguration(iceServers):", err.message);
+      }
+    },
+    [getIceConfig],
+  );
 
   // ── Медиа ──
   const acquireMediaCached = useCallback(async () => {
@@ -178,9 +207,10 @@ export function useWebRTC({ send, setOnMessage }) {
     try { hbChannelRef.current?.close(); } catch { /* ok */ }
     hbChannelRef.current = null;
     clearIceDisconnectTimer();
+    clearPeerDisconnectTimer();
     clearRestartGuard();
     clearStatsInterval();
-    stopStream(screenStreamRef.current);
+    disposeScreenShare(screenStreamRef.current);
     screenStreamRef.current = null;
     setIsScreenSharing(false);
     makingOfferRef.current = false;
@@ -225,34 +255,44 @@ export function useWebRTC({ send, setOnMessage }) {
           `${ICE_RESTART_LIMIT_IN_WINDOW} рестартов за ${ICE_RESTART_WINDOW_MS}мс → recreatePc`,
         );
         restartHistoryRef.current = [];
-        recreatePc();
+        void recreatePc();
         return;
       }
       restartHistoryRef.current.push(now);
 
-      log.ice("вызов restartIce()");
-      pc.restartIce();
-      clearRestartGuard();
-      restartGuardTimerRef.current = setTimeout(async () => {
-        if (pcRef.current !== pc) return;
-        const s = pc.iceConnectionState;
-        if (s === "connected" || s === "completed") {
-          restartFailureCountRef.current = 0;
-          return;
-        }
-        restartFailureCountRef.current += 1;
-        log.warn(
-          `restartIce не помог за ${ICE_RESTART_FAIL_TIMEOUT_MS}мс ` +
-            `(попытка ${restartFailureCountRef.current}/${PC_RECREATE_AFTER_FAILURES})`,
-        );
-        if (restartFailureCountRef.current >= PC_RECREATE_AFTER_FAILURES) {
+      void (async () => {
+        try {
+          await refreshIceConfigForPc(pc);
+          if (pcRef.current !== pc || pc.connectionState === "closed") return;
+
+          log.ice("вызов restartIce()");
+          pc.restartIce();
+          clearRestartGuard();
+          restartGuardTimerRef.current = setTimeout(async () => {
+            if (pcRef.current !== pc) return;
+            const s = pc.iceConnectionState;
+            if (s === "connected" || s === "completed") {
+              restartFailureCountRef.current = 0;
+              return;
+            }
+            restartFailureCountRef.current += 1;
+            log.warn(
+              `restartIce не помог за ${ICE_RESTART_FAIL_TIMEOUT_MS}мс ` +
+                `(попытка ${restartFailureCountRef.current}/${PC_RECREATE_AFTER_FAILURES})`,
+            );
+            if (restartFailureCountRef.current >= PC_RECREATE_AFTER_FAILURES) {
+              await recreatePc();
+            } else {
+              handleIceFailure(pc);
+            }
+          }, ICE_RESTART_FAIL_TIMEOUT_MS);
+        } catch (err) {
+          log.warn("restartIce подготовка не удалась:", err.message);
           await recreatePc();
-        } else {
-          handleIceFailure(pc);
         }
-      }, ICE_RESTART_FAIL_TIMEOUT_MS);
+      })();
     },
-    [recreatePc],
+    [recreatePc, refreshIceConfigForPc],
   );
 
   const startStatsLoop = useCallback((pc) => {
@@ -288,6 +328,7 @@ export function useWebRTC({ send, setOnMessage }) {
     const setupHeartbeat = (ch) => {
       hbChannelRef.current = ch;
       let restartAttempted = false;
+      let restartStartedAt = 0;
 
       ch.onopen = () => {
         log.pc("heartbeat: канал открыт");
@@ -307,7 +348,10 @@ export function useWebRTC({ send, setOnMessage }) {
           if (!restartAttempted) {
             log.warn(`heartbeat: тишина ${silence}мс → restartIce`);
             restartAttempted = true;
+            restartStartedAt = Date.now();
             handleIceFailure(pc);
+          } else if (Date.now() - restartStartedAt < ICE_RESTART_FAIL_TIMEOUT_MS + HEARTBEAT_INTERVAL_MS) {
+            log.warn("heartbeat: жду результат restartIce");
           } else {
             log.warn(`heartbeat: ${silence}мс после restartIce → пир мёртв`);
             clearInterval(hbWatchdogRef.current);
@@ -384,6 +428,7 @@ export function useWebRTC({ send, setOnMessage }) {
 
       if (s === "connected" || s === "completed") {
         clearIceDisconnectTimer();
+        clearPeerDisconnectTimer();
         clearRestartGuard();
         restartFailureCountRef.current = 0;
         restartHistoryRef.current = [];
@@ -420,6 +465,10 @@ export function useWebRTC({ send, setOnMessage }) {
         log.neg("negotiationneeded подавлен (начальный сетап receiver)");
         return;
       }
+      if (pc.signalingState !== "stable") {
+        log.neg("negotiationneeded пропущен, signalingState=", pc.signalingState);
+        return;
+      }
       try {
         log.neg("negotiationneeded, signalingState=", pc.signalingState);
         makingOfferRef.current = true;
@@ -444,12 +493,12 @@ export function useWebRTC({ send, setOnMessage }) {
     const pc = pcRef.current;
     if (!pc) return;
     try {
-      const { screenStream, displayStream, screenVideoTrack } =
-        await libStartScreenShare(pc, cameraStreamRef.current);
-      screenStreamRef.current = screenStream;
+      const screenShare = await libStartScreenShare(pc, cameraStreamRef.current);
+      const { displayStream, screenVideoTrack } = screenShare;
+      screenStreamRef.current = screenShare;
       setLocalStream(displayStream);
       setIsScreenSharing(true);
-      screenVideoTrack.onended = () => stopScreenShareCmd();
+      if (screenVideoTrack) screenVideoTrack.onended = () => stopScreenShareCmd();
     } catch (err) {
       if (err.name !== "NotAllowedError") log.err("getDisplayMedia FAIL:", err);
     }
@@ -463,6 +512,22 @@ export function useWebRTC({ send, setOnMessage }) {
     screenStreamRef.current = null;
     setLocalStream(cam);
     setIsScreenSharing(false);
+  }, []);
+
+  const flushPendingCandidates = useCallback(async (pc) => {
+    if (!pc?.remoteDescription || !pendingCandidatesRef.current.length) return;
+
+    const pending = pendingCandidatesRef.current;
+    pendingCandidatesRef.current = [];
+    log.ice("применяю", pending.length, "буферизованных кандидатов");
+
+    for (const c of pending) {
+      try {
+        await pc.addIceCandidate(c);
+      } catch (err) {
+        if (!ignoreOfferRef.current) log.warn("addIceCandidate (buffered):", err.message);
+      }
+    }
   }, []);
 
   // ── Начальные сетапы ──
@@ -484,48 +549,47 @@ export function useWebRTC({ send, setOnMessage }) {
       setStatus("connecting");
       const stream = await acquireMediaCached();
 
-      suppressNegotiationRef.current = true;
       const pc = await createPC();
-      stream.getTracks().forEach((t) => pc.addTrack(t, stream));
-      preferLowLatencyCodecs(pc);
+      suppressNegotiationRef.current = true;
+      try {
+        stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+        preferLowLatencyCodecs(pc);
 
-      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-      log.neg("remoteDescription установлен:", describeSdp(sdp));
-      await pc.setLocalDescription();
-      log.neg("→ отправляю answer:", describeSdp(pc.localDescription));
-      send({ type: "answer", sdp: pc.localDescription });
-
-      suppressNegotiationRef.current = false;
-
-      if (pendingCandidatesRef.current.length) {
-        log.ice("применяю", pendingCandidatesRef.current.length, "буферизованных кандидатов");
-        for (const c of pendingCandidatesRef.current) {
-          try {
-            await pc.addIceCandidate(c);
-          } catch (err) {
-            log.warn("addIceCandidate (buffered):", err.message);
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        log.neg("remoteDescription установлен:", describeSdp(sdp));
+        await flushPendingCandidates(pc);
+        await pc.setLocalDescription();
+        log.neg("→ отправляю answer:", describeSdp(pc.localDescription));
+        send({ type: "answer", sdp: pc.localDescription });
+      } finally {
+        setTimeout(() => {
+          if (pcRef.current === pc) {
+            suppressNegotiationRef.current = false;
           }
-        }
-        pendingCandidatesRef.current = [];
+        }, 0);
       }
     },
-    [acquireMediaCached, createPC, send],
+    [acquireMediaCached, createPC, flushPendingCandidates, send],
   );
 
   // ── onPeerReady (#10): различает живой/умерший PC ──
   const onPeerReady = useCallback(
-    async (polite) => {
+    async (polite, { forceRenegotiate = false } = {}) => {
       politeRef.current = polite;
       clearPeerDisconnectTimer();
       log.neg(
-        `onPeerReady: polite=${polite}, роль=${polite ? "polite (ждёт)" : "impolite (инициатор)"}`,
+        `onPeerReady: polite=${polite}, force=${forceRenegotiate}, ` +
+          `роль=${polite ? "polite (ждёт)" : "impolite (инициатор)"}`,
       );
 
       const pc = pcRef.current;
       if (pc) {
         const cs = pc.connectionState;
-        // PC жив и в норме — ничего не делаем, начальный сетап не нужен
-        if (cs === "connected" || cs === "connecting" || cs === "new") {
+        if (forceRenegotiate) {
+          log.neg(`peer_joined при PC state=${cs} → пересоздаю для нового соединения пира`);
+          closePc();
+        } else if (cs === "connected" || cs === "connecting" || cs === "new") {
+          // PC жив и в норме — ничего не делаем, начальный сетап не нужен
           log.neg(`PC жив (state=${cs}) — пропускаю инициацию`);
           if (
             !polite &&
@@ -564,26 +628,35 @@ export function useWebRTC({ send, setOnMessage }) {
       log.neg("handleOffer: collision=", offerCollision, "ignore=", ignoreOfferRef.current);
       if (ignoreOfferRef.current) return;
       await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      await flushPendingCandidates(pc);
       await pc.setLocalDescription();
       log.neg("→ отправляю answer:", describeSdp(pc.localDescription));
       send({ type: "answer", sdp: pc.localDescription });
     },
-    [send],
+    [flushPendingCandidates, send],
   );
 
-  const handleAnswer = useCallback(async (sdp) => {
-    const pc = pcRef.current;
-    if (!pc) return;
-    try {
-      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-      log.neg("answer применён:", describeSdp(sdp));
-    } catch (err) {
-      log.warn("setRemoteDescription(answer):", err.message);
-    }
-  }, []);
+  const handleAnswer = useCallback(
+    async (sdp) => {
+      const pc = pcRef.current;
+      if (!pc) return;
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        log.neg("answer применён:", describeSdp(sdp));
+        await flushPendingCandidates(pc);
+      } catch (err) {
+        log.warn("setRemoteDescription(answer):", err.message);
+      }
+    },
+    [flushPendingCandidates],
+  );
 
   const handleIceCandidate = useCallback(async (candidate) => {
     const pc = pcRef.current;
+    if (ignoreOfferRef.current) {
+      log.ice("remote candidate проигнорирован вместе с collision offer");
+      return;
+    }
     const ice = new RTCIceCandidate(candidate);
     log.ice("remote candidate ←", describeCandidate(candidate));
     if (!pc || !pc.remoteDescription) {
@@ -633,7 +706,7 @@ export function useWebRTC({ send, setOnMessage }) {
           case "peer_joined":
             log.ws("← peer_joined polite=", data.polite);
             if (typeof data.polite === "boolean") {
-              await onPeerReady(data.polite);
+              await onPeerReady(data.polite, { forceRenegotiate: true });
             }
             break;
 
@@ -711,6 +784,25 @@ export function useWebRTC({ send, setOnMessage }) {
     setOnMessage, acquireMediaCached, onPeerReady, initAsReceiverAndAnswer,
     handleOffer, handleAnswer, handleIceCandidate, closePc,
   ]);
+
+  useEffect(() => {
+    if (!setOnDisconnect) return undefined;
+
+    setOnDisconnect((code, reason) => {
+      const messages = {
+        4001: "Сессия уже заполнена",
+        4002: "Достигнут лимит активных сессий",
+        4003: "Недопустимый ключ сессии",
+      };
+      closePc();
+      setRemoteStream(null);
+      setRemoteMediaState({ camera: true, mic: true });
+      setStatus("disconnected");
+      setError(messages[code] || reason || "WebSocket-соединение закрыто сервером");
+    });
+
+    return () => setOnDisconnect(null);
+  }, [closePc, setOnDisconnect]);
 
   // ── devicechange listener (#13) ──
   useEffect(() => {

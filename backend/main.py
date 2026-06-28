@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import Depends, FastAPI, Path, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -225,6 +225,10 @@ async def signaling(
         result.count, sessions.count, sessions.max_sessions,
     )
 
+    if result.previous_ws is not None:
+        with suppress(Exception):
+            await result.previous_ws.close(code=1000, reason="Reconnected")
+
     await safe_send_json(ws, {"type": "role", "polite": polite})
 
     # 4. Уведомить пира, что мы пришли
@@ -251,6 +255,11 @@ async def signaling(
         while True:
             raw = await ws.receive_json()
 
+            if not sessions.is_current_client_ws(session_key, client_id, ws):
+                logger.info("[%s] %s stale WS, закрываю без уведомления пира", session_key, client_id)
+                await ws.close(code=1000, reason="Stale connection")
+                break
+
             # Token bucket: ограничение спама
             if not bucket.try_consume():
                 logger.warning(
@@ -270,6 +279,7 @@ async def signaling(
                 )
                 continue
 
+            await sessions.touch(session_key)
             msg_type = msg.type
 
             if msg_type == "pong":
@@ -302,11 +312,13 @@ async def signaling(
         logger.error("[%s] -%s  ошибка: %s", session_key, client_id, exc)
     finally:
         ping_task.cancel()
-        await sessions.remove_client(session_key, client_id)
+        with suppress(asyncio.CancelledError):
+            await ping_task
+        removed = await sessions.remove_client(session_key, client_id, ws)
         logger.info("Сессий: %d/%d", sessions.count, sessions.max_sessions)
 
         peer_ws = sessions.get_peer_ws(session_key, client_id)
-        if peer_ws and not hangup_sent:
+        if removed and peer_ws and not hangup_sent:
             await safe_send_json(peer_ws, {"type": "peer_disconnected"})
 
 

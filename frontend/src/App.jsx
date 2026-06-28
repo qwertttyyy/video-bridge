@@ -325,12 +325,10 @@ function Call({
           <IconUser />
         </div>
       ) : (
-        <Video stream={remoteStream} volume={peerVolume} className="remote-video" />
+        <Video stream={remoteStream} muted className="remote-video" />
       )}
 
-      {/* Аудио идёт всегда (если remoteStream есть), даже когда показан placeholder.
-          Скрытый <audio> играет remote-стрим вне зависимости от <video>. */}
-      {showRemotePlaceholder && remoteStream && (
+      {remoteStream && (
         <RemoteAudio stream={remoteStream} volume={peerVolume} />
       )}
 

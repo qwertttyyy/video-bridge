@@ -12,6 +12,9 @@ export const PC_RECREATE_AFTER_FAILURES = 2;     // пересоздать PC п
 // ── Сигналинг ──
 export const RECONNECT_INITIAL_DELAY_MS = 500;
 export const RECONNECT_MAX_DELAY_MS = 5000;
+export const SIGNALING_QUEUE_TTL_MS = 15000;
+export const SIGNALING_QUEUE_MAX_MESSAGES = 200;
+export const ICE_CONFIG_REFRESH_MARGIN_MS = 60000;
 
 // ── Статистика и UI ──
 export const STATS_INTERVAL_MS = 5000;            // частота опроса getStats для индикатора качества

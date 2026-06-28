@@ -1,31 +1,28 @@
-# DEPLOY.md
-# Деплой Video Bridge — nginx (apt) + certbot + Docker
+# Деплой Video Bridge На VPS
 
----
+Инструкция актуальна для VPS, где системный nginx уже настроен отдельно и отдает frontend из `/var/www/video-bridge`, а backend и coturn запускаются через Docker Compose.
+
+В репозитории не нужен nginx-конфиг и не нужен отдельный nginx-контейнер. На проде тесты запускать не нужно. Проверки ниже - только короткие smoke-команды: `docker compose ps` и `curl`.
 
 ## 1. Подготовка сервера
 
 ```bash
 sudo apt update && sudo apt upgrade -y
 
-# Docker (если ещё нет)
+# Docker
 curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker $USER
 
-# Node.js 20 (для сборки фронтенда)
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt install -y nodejs
-
-# Certbot
-sudo apt install -y certbot python3-certbot-nginx
+# nginx/certbot должны быть настроены на VPS отдельно, если их еще нет
+sudo apt install -y nginx certbot python3-certbot-nginx
 
 # Перелогиньтесь, чтобы группа docker подхватилась
 exit
 ```
 
----
+Node.js на VPS для продовой сборки не нужен: frontend собирается только Docker-образом `frontend-build`.
 
-## 2. Файрвол (ufw)
+## 2. Файрвол
 
 ```bash
 sudo ufw allow OpenSSH
@@ -33,193 +30,179 @@ sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
 sudo ufw allow 3478/tcp
 sudo ufw allow 3478/udp
-sudo ufw allow 49152:49252/udp   # Медиа-порты coturn
+sudo ufw allow 49152:49252/udp
 sudo ufw enable
 ```
 
----
+Backend наружу не открывается: Docker Compose публикует его только на `127.0.0.1:${BACKEND_HOST_PORT}`.
 
-## 3. Проект на сервер
+## 3. Проект
 
 ```bash
-# Вариант A — архив
-scp video-bridge.tar.gz user@SERVER_IP:~
-ssh user@SERVER_IP
-tar -xzf video-bridge.tar.gz
-cd video-bridge
-
-# Вариант B — git
-git clone <repo-url> video-bridge && cd video-bridge
+cd /opt/projects
+git clone <repo-url> video-bridge
+cd /opt/projects/video-bridge
 ```
 
----
+Если проект уже есть на VPS:
 
-## 4. Настройка .env
+```bash
+cd /opt/projects/video-bridge
+git pull
+```
+
+## 4. `.env`
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-```
-SERVER_IP=<реальный публичный IP>
+Пример для `video.qwertttyyy.ru`:
+
+```env
+SERVER_IP=157.22.230.215
 SERVER_DOMAIN=video.qwertttyyy.ru
-TURN_USERNAME=myuser
-TURN_PASSWORD=<надёжный_пароль>
+TURN_SECRET=replace_with_openssl_rand_hex_32
+TURN_REALM=video.qwertttyyy.ru
 FRONTEND_ORIGIN=https://video.qwertttyyy.ru
+BACKEND_HOST_PORT=8000
+MAX_SESSIONS=10
+SESSIONS_RATE_LIMIT=10/minute
+TURN_CRED_TTL=3600
 ```
 
----
-
-## 5. Сборка фронтенда
+`TURN_SECRET` генерируется так:
 
 ```bash
-cd frontend
-npm install
-npm run build        # → dist/
+openssl rand -hex 32
+```
+
+`BACKEND_HOST_PORT` - порт backend на localhost VPS. Если меняете его с `8000` на другой, замените этот же порт в nginx-конфиге `proxy_pass`.
+
+## 5. Frontend Только Через Docker
+
+```bash
+cd /opt/projects/video-bridge
 sudo mkdir -p /var/www/video-bridge
-sudo cp -r dist/* /var/www/video-bridge/
-cd ..
+sudo rm -rf /var/www/video-bridge/*
+docker compose --profile build build frontend-build
+docker compose --profile build run --rm frontend-build
 ```
 
----
+После этого nginx будет отдавать файлы из `/var/www/video-bridge`.
 
-## 6. Настройка nginx
-
-```bash
-# Копируем конфиг
-sudo cp nginx/video.qwertttyyy.ru /etc/nginx/sites-available/video.qwertttyyy.ru
-
-# Активируем
-sudo ln -sf /etc/nginx/sites-available/video.qwertttyyy.ru /etc/nginx/sites-enabled/
-
-# Проверяем синтаксис
-sudo nginx -t
-
-# Пока HTTPS-блок сломается (нет сертификата) — временно закомментируйте его:
-sudo nano /etc/nginx/sites-available/video.qwertttyyy.ru
-# Закомментируйте весь блок server { listen 443 ... }
-
-# Перезапускаем с HTTP-only
-sudo systemctl reload nginx
-```
-
----
-
-## 7. Получение TLS-сертификата
+## 6. Backend И Coturn
 
 ```bash
-# Создаём директорию для challenge
-sudo mkdir -p /var/www/certbot
-
-# Получаем сертификат
-sudo certbot certonly --webroot -w /var/www/certbot -d video.qwertttyyy.ru
-```
-
-После успешного получения:
-
-```bash
-# Раскомментируйте HTTPS-блок в конфиге
-sudo nano /etc/nginx/sites-available/video.qwertttyyy.ru
-
-# Раскомментируйте редирект HTTP → HTTPS (строка return 301)
-
-# Проверяем и перезагружаем
-sudo nginx -t && sudo systemctl reload nginx
-```
-
-Автообновление сертификата:
-
-```bash
-# certbot ставит cron/timer автоматически, проверяем:
-sudo systemctl list-timers | grep certbot
-```
-
----
-
-## 8. Запуск Docker-сервисов
-
-```bash
-cd ~/video-bridge
-docker compose up --build -d
-
-# Проверка
+cd /opt/projects/video-bridge
+docker compose up -d --build backend coturn
 docker compose ps
-docker compose logs -f backend
-docker compose logs -f coturn
 ```
 
----
-
-## 9. Проверка coturn
+Короткая проверка backend:
 
 ```bash
-# Из пакета coturn-utils
-sudo apt install -y coturn-utils
-turnutils_uclient -T -u myuser -w '<пароль>' -p 3478 <SERVER_IP>
-```
-
-Или онлайн: https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/
-→ добавьте `turn:<SERVER_IP>:3478`, логин/пароль → Gather candidates → ищите `relay`.
-
----
-
-## 10. Тестирование
-
-1. Откройте `https://video.qwertttyyy.ru`
-2. **Создать сессию** → скопируйте ключ
-3. Второе устройство → вставьте ключ → **Подключиться**
-4. Разрешите камеру/микрофон
-
----
-
-## 11. Типичные проблемы
-
-### nginx отдаёт 502 Bad Gateway
-
-```bash
-# Бэкенд запущен?
-docker compose ps backend
 curl -s http://127.0.0.1:8000/api/ice-config
 ```
 
-### WebSocket не подключается (ошибка в консоли браузера)
+Если `BACKEND_HOST_PORT` не `8000`, используйте свой порт:
 
-Проверьте блок `/ws/` в nginx — нужен `proxy_http_version 1.1` и заголовки Upgrade/Connection.
+```bash
+curl -s http://127.0.0.1:${BACKEND_HOST_PORT}/api/ice-config
+```
+
+## 7. nginx На VPS
+
+Отдельный nginx-контейнер не используется. nginx-конфиг не хранится в репозитории.
+
+Проверьте на VPS в уже существующем nginx-конфиге:
+
+- frontend root указывает на `/var/www/video-bridge`;
+- `/api/` проксируется на `http://127.0.0.1:8000`;
+- `/ws/` проксируется на `http://127.0.0.1:8000`;
+- для `/ws/` включены HTTP/1.1 и заголовки `Upgrade`/`Connection`.
+
+Если в `.env` меняете `BACKEND_HOST_PORT`, тот же порт должен быть указан в существующем nginx `proxy_pass`.
+
+## 8. Обновление Frontend
+
+Только Docker-сборка:
+
+```bash
+cd /opt/projects/video-bridge
+git pull
+sudo rm -rf /var/www/video-bridge/*
+docker compose --profile build build frontend-build
+docker compose --profile build run --rm frontend-build
+```
+
+Для простой замены статических файлов nginx перезапускать не нужно. Перезагружайте nginx только если меняли его конфиг.
+
+## 9. Обновление Backend/Coturn
+
+```bash
+cd /opt/projects/video-bridge
+git pull
+docker compose up -d --build backend coturn
+docker compose ps
+curl -s http://127.0.0.1:8000/api/ice-config
+```
+
+Если меняли только frontend, backend/coturn перезапускать не обязательно.
+
+## 10. Smoke-Проверка После Деплоя
+
+```bash
+docker compose ps
+docker compose logs --tail=80 backend
+docker compose logs --tail=80 coturn
+curl -s http://127.0.0.1:8000/api/ice-config
+```
+
+В браузере:
+
+1. Откройте `https://video.qwertttyyy.ru`.
+2. Создайте сессию.
+3. Подключитесь со второй вкладки или второго устройства.
+4. Проверьте камеру, микрофон, reconnect после перезагрузки вкладки.
+5. Проверьте демонстрацию экрана. Звук демонстрации будет отправляться только если браузер реально вернул audio track из `getDisplayMedia`.
+
+## 11. Диагностика
+
+### nginx отдает 502
+
+```bash
+docker compose ps backend
+curl -s http://127.0.0.1:8000/api/ice-config
+sudo tail -80 /var/log/nginx/error.log
+```
+
+Проверьте, что порт в `BACKEND_HOST_PORT` совпадает с портом в nginx `proxy_pass`.
+
+### WebSocket не подключается
+
+Проверьте блок `/ws/` в nginx: нужны HTTP/1.1, `Upgrade`, `Connection`, увеличенный `proxy_read_timeout`.
 
 ### ICE connection failed
 
 ```bash
-ss -tulnp | grep 3478                  # coturn слушает?
-docker compose logs coturn | head -30  # ошибки?
+ss -tulnp | grep 3478
+docker compose logs --tail=120 coturn
 ```
 
-Частые причины: неправильный `SERVER_IP` в `.env`, закрыты UDP-порты 49152–49252.
+Частые причины:
 
-### Нет видео (getUserMedia)
+- неверный `SERVER_IP`;
+- закрыты `3478/tcp`, `3478/udp` или `49152:49252/udp`;
+- `TURN_SECRET` в `.env` не совпадает с `--static-auth-secret` coturn из compose.
 
-- Страница **обязана** быть на HTTPS (проверьте замок в адресной строке)
-- В Chrome: `chrome://webrtc-internals` для диагностики
-- Проверьте разрешения камеры в настройках браузера
+### Нет камеры/микрофона
 
-### CORS
+- сайт должен открываться по HTTPS;
+- проверьте разрешения браузера;
+- смотрите `chrome://webrtc-internals`.
 
-`FRONTEND_ORIGIN` в `.env` должен совпадать с URL сайта: `https://video.qwertttyyy.ru` (без `/` в конце).
+### Нет звука демонстрации экрана
 
----
-
-## 12. Обновление фронтенда
-
-```bash
-cd ~/video-bridge/frontend
-npm run build
-sudo rm -rf /var/www/video-bridge/*
-sudo cp -r dist/* /var/www/video-bridge/
-```
-
-## 13. Перезапуск бэкенда
-
-```bash
-cd ~/video-bridge
-docker compose up --build -d backend
-```
+Код приложения отправляет звук демонстрации, если браузер возвращает audio track. На Linux это зависит от браузера, Wayland/X11, PipeWire/PulseAudio и выбранного типа захвата; для некоторых вариантов screen/window capture системный звук браузер может не отдавать.

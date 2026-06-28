@@ -43,6 +43,7 @@ class RegisterResult:
     count: int               # участников в сессии после регистрации
     peer_id: str | None      # id собеседника, если есть
     is_reconnect: bool
+    previous_ws: WebSocket | None = None
 
 
 class SessionManager:
@@ -138,6 +139,7 @@ class SessionManager:
                 self._sessions[key] = session
 
             is_reconnect = client_id in session.clients
+            previous_ws = session.clients.get(client_id)
 
             # Реконнект того же client_id всегда разрешён
             if not is_reconnect and session.is_full:
@@ -156,13 +158,32 @@ class SessionManager:
                 count=len(session.clients),
                 peer_id=peer_id,
                 is_reconnect=is_reconnect,
+                previous_ws=previous_ws if previous_ws is not ws else None,
             )
 
-    async def remove_client(self, key: str, client_id: str) -> None:
+    async def remove_client(
+        self,
+        key: str,
+        client_id: str,
+        ws: WebSocket | None = None,
+    ) -> bool:
+        """
+        Удаляет клиента из сессии.
+
+        Если передан ws, удаление выполняется только когда закрывается
+        именно текущее соединение. Это защищает reconnect: старый handler
+        не должен удалить новый WebSocket с тем же client_id.
+        """
         async with self._lock:
             session = self._sessions.get(key)
             if session is None:
-                return
+                return False
+            current_ws = session.clients.get(client_id)
+            if current_ws is None:
+                return False
+            if ws is not None and current_ws is not ws:
+                logger.info("Старое соединение %s/%s уже заменено, не удаляю", key, client_id)
+                return False
             session.clients.pop(client_id, None)
             session.touch()
             if not session.clients:
@@ -170,6 +191,14 @@ class SessionManager:
                     "Сессия %s пуста, будет удалена через %ds",
                     key, SESSION_TTL_EMPTY,
                 )
+            return True
+
+    async def touch(self, key: str) -> None:
+        """Обновляет активность сессии, если она ещё существует."""
+        async with self._lock:
+            session = self._sessions.get(key)
+            if session is not None:
+                session.touch()
 
     # ── Чтение состояния ─────────────────────────────────────────
 
@@ -202,3 +231,10 @@ class SessionManager:
         if peer_id is None:
             return None
         return client_id < peer_id
+
+    def is_current_client_ws(self, key: str, client_id: str, ws: WebSocket) -> bool:
+        """Проверяет, что ws всё ещё является актуальным соединением клиента."""
+        session = self._sessions.get(key)
+        if session is None:
+            return False
+        return session.clients.get(client_id) is ws

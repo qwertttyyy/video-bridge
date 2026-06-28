@@ -9,10 +9,22 @@ export async function getSelectedPair(pc) {
   try {
     const stats = await pc.getStats();
     let pair = null;
+    let selectedPairId = null;
     const cands = new Map();
+
     for (const s of stats.values()) {
-      if (s.type === "candidate-pair" && s.nominated && s.state === "succeeded") {
-        pair = s;
+      if (s.type === "transport" && s.selectedCandidatePairId) {
+        selectedPairId = s.selectedCandidatePairId;
+      }
+    }
+
+    for (const s of stats.values()) {
+      if (s.type === "candidate-pair") {
+        if (s.id === selectedPairId || s.selected) {
+          pair = s;
+        } else if (!pair && s.nominated && s.state === "succeeded") {
+          pair = s;
+        }
       }
       if (s.type === "local-candidate" || s.type === "remote-candidate") {
         cands.set(s.id, s);
