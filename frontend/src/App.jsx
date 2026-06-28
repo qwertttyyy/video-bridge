@@ -9,6 +9,11 @@ import {
   IconLink, IconCheck, IconSun, IconMoon, IconBridge, IconUser,
   IconEye, IconEyeOff, IconResize,
 } from "./Icons";
+import {
+  NOISE_SUPPRESSION_STORAGE_KEY,
+  applyAudioProcessingConstraints,
+  getStoredNoiseSuppressionEnabled,
+} from "./lib/media";
 import "./App.css";
 
 const getClientId = () => {
@@ -226,6 +231,7 @@ function Lobby({ onJoin, initialKey, theme, onToggleTheme }) {
 
 function MediaControls({
   camOn, micOn, onCameraToggle, onMicToggle,
+  noiseSuppressionEnabled, onNoiseSuppressionToggle,
   volume, onVolumeChange, onHangUp,
   isScreenSharing, onStartScreen, onStopScreen,
   pipVisible, onTogglePip,
@@ -240,6 +246,14 @@ function MediaControls({
         title={micOn ? "Выключить микрофон" : "Включить микрофон"}
       >
         {micOn ? <IconMic /> : <IconMicOff />}
+      </button>
+
+      <button
+        className={`ctrl-btn ${noiseSuppressionEnabled ? "ctrl-active" : ""}`}
+        onClick={() => onNoiseSuppressionToggle(!noiseSuppressionEnabled)}
+        title={noiseSuppressionEnabled ? "Отключить шумоподавление" : "Включить шумоподавление"}
+      >
+        <span className="ctrl-btn-label">NS</span>
       </button>
 
       <button
@@ -299,6 +313,7 @@ function Call({
   theme, onToggleTheme,
   localMediaState, remoteMediaState,
   onCameraToggle, onMicToggle,
+  noiseSuppressionEnabled, onNoiseSuppressionToggle,
   connectionQuality,
 }) {
   const [peerVolume, setPeerVolume] = useState(1);
@@ -366,6 +381,8 @@ function Call({
         micOn={localMediaState?.mic ?? true}
         onCameraToggle={onCameraToggle}
         onMicToggle={onMicToggle}
+        noiseSuppressionEnabled={noiseSuppressionEnabled}
+        onNoiseSuppressionToggle={onNoiseSuppressionToggle}
         volume={peerVolume}
         onVolumeChange={setPeerVolume}
         onHangUp={onHangUp}
@@ -401,6 +418,7 @@ function RemoteAudio({ stream, volume }) {
 export default function App() {
   const [sessionKey, setSessionKey] = useState(null);
   const [, setIsCreator] = useState(false);
+  const [noiseSuppressionEnabled, setNoiseSuppressionEnabled] = useState(getStoredNoiseSuppressionEnabled);
   const { theme, toggle: toggleTheme } = useTheme();
   const signaling = useSignaling();
   const {
@@ -412,6 +430,15 @@ export default function App() {
   } = useWebRTC(signaling);
 
   const urlSessionKey = getSessionFromUrl();
+
+  const handleNoiseSuppressionToggle = useCallback(
+    async (enabled) => {
+      setNoiseSuppressionEnabled(enabled);
+      localStorage.setItem(NOISE_SUPPRESSION_STORAGE_KEY, enabled ? "on" : "off");
+      await applyAudioProcessingConstraints(localStream, enabled);
+    },
+    [localStream],
+  );
 
   const handleJoin = useCallback(
     (key, creator = false) => {
@@ -469,6 +496,8 @@ export default function App() {
       remoteMediaState={remoteMediaState}
       onCameraToggle={setLocalCameraEnabled}
       onMicToggle={setLocalMicEnabled}
+      noiseSuppressionEnabled={noiseSuppressionEnabled}
+      onNoiseSuppressionToggle={handleNoiseSuppressionToggle}
       connectionQuality={connectionQuality}
     />
   );
