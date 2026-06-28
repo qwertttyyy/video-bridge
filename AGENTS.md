@@ -119,7 +119,7 @@ WebSocket:
 
 События сервер-клиент:
 
-- `peer_joined`
+- `peer_joined` с полем `reconnect`: `true`, если это новый WebSocket того же `client_id`, и `false`, если в комнату вошёл новый участник.
 - `peer_left`
 - `peer_disconnected`
 - `ping`

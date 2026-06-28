@@ -643,6 +643,7 @@ export function useWebRTC({ send, setOnMessage, setOnDisconnect }) {
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(sdp));
         log.neg("answer применён:", describeSdp(sdp));
+        ignoreOfferRef.current = false;
         await flushPendingCandidates(pc);
       } catch (err) {
         log.warn("setRemoteDescription(answer):", err.message);
@@ -706,7 +707,7 @@ export function useWebRTC({ send, setOnMessage, setOnDisconnect }) {
           case "peer_joined":
             log.ws("← peer_joined polite=", data.polite);
             if (typeof data.polite === "boolean") {
-              await onPeerReady(data.polite, { forceRenegotiate: true });
+              await onPeerReady(data.polite, { forceRenegotiate: data.reconnect !== true });
             }
             break;
 

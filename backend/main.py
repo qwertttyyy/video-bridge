@@ -237,6 +237,7 @@ async def signaling(
         await safe_send_json(peer_ws, {
             "type": "peer_joined",
             "polite": sessions.is_polite(session_key, result.peer_id),
+            "reconnect": result.is_reconnect,
         })
 
     # 5. Запустить keepalive и обработку сообщений

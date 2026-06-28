@@ -33,7 +33,11 @@ def test_websocket_roles_relay_and_hangup(main_module):
 
             with client.websocket_connect("/ws/room1/clientB") as b:
                 assert b.receive_json() == {"type": "role", "polite": False}
-                assert a.receive_json() == {"type": "peer_joined", "polite": True}
+                assert a.receive_json() == {
+                    "type": "peer_joined",
+                    "polite": True,
+                    "reconnect": False,
+                }
 
                 b.send_json({"type": "media-state", "camera": False, "mic": True})
                 assert a.receive_json() == {
@@ -108,11 +112,19 @@ def test_reconnect_same_client_does_not_emit_peer_disconnected_from_stale_ws(mai
             assert old_ws.receive_json()["type"] == "role"
             with client.websocket_connect("/ws/room1/clientB") as peer:
                 assert peer.receive_json()["type"] == "role"
-                assert old_ws.receive_json()["type"] == "peer_joined"
+                assert old_ws.receive_json() == {
+                    "type": "peer_joined",
+                    "polite": True,
+                    "reconnect": False,
+                }
 
                 with client.websocket_connect("/ws/room1/clientA") as new_ws:
                     assert new_ws.receive_json()["type"] == "role"
-                    assert peer.receive_json()["type"] == "peer_joined"
+                    assert peer.receive_json() == {
+                        "type": "peer_joined",
+                        "polite": False,
+                        "reconnect": True,
+                    }
                     old.__exit__(None, None, None)
                     old = None
 
